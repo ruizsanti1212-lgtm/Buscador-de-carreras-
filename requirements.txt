@@ -3,3 +3,4 @@ easyocr
 pandas
 pillow
 supabase
+httpx
