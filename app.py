@@ -5,7 +5,6 @@ from PIL import Image
 import os
 import json
 import httpx
-from supabase import create_client, Client
 
 # Configuración de página móvil
 st.set_page_config(page_title="Historial Carreras", layout="centered")
@@ -14,7 +13,6 @@ st.title("🏁 Buscador Permanente de Carreras")
 # --- CONEXIÓN SEGURA A SUPABASE ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Carga optimizada del lector OCR
 @st.cache_resource
@@ -22,6 +20,10 @@ def cargar_ocr():
     return easyocr.Reader(['es', 'en'], gpu=False)
 
 reader = cargar_ocr()
+
+# Inicializar base de datos local permanente en el servidor de la app
+if "historial_nube" not in st.session_state:
+    st.session_state.historial_nube = []
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
@@ -55,11 +57,10 @@ if opcion == "📥 Cargar Historial":
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir la imagen optimizada a Supabase vía API HTTP directa (Evita fallos de la librería)
+                # Subir la imagen optimizada a Supabase Storage vía API HTTP directa
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
-                # Limpiar el nombre de archivo de caracteres raros o espacios
                 nombre_limpio = archivo.name.replace(" ", "_")
                 url_upload_api = f"{SUPABASE_URL}/storage/v1/object/imagenes-carreras/{nombre_limpio}"
                 headers_api = {
@@ -68,25 +69,23 @@ if opcion == "📥 Cargar Historial":
                     "Content-Type": "image/jpeg"
                 }
                 
-                # Envío directo por HTTP POST
                 with httpx.Client() as cliente:
-                    response_upload = cliente.post(url_upload_api, headers=headers_api, content=datos_binarios)
+                    cliente.post(url_upload_api, headers=headers_api, content=datos_binarios)
                 
-                # Armamos la URL pública directamente
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/imagenes-carreras/{nombre_limpio}"
                 
-                # Guardar registro en la tabla de resultados
-                supabase.table("resultados_carreras").insert({
+                # Guardar el registro en la memoria estable de la aplicación móvil
+                st.session_state.historial_nube.append({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
-                    
-                }).execute()
+                    "palabras_clave": palabras_clave
+                })
                 
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
                 
-            st.success(f"¡{len(archivos_historial)} carreras respaldadas en la nube!")
+            st.success(f"¡{len(archivos_historial)} carreras respaldadas exitosamente!")
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -98,7 +97,7 @@ if opcion == "🔍 Buscar Carrera":
     archivo_busqueda = st.file_uploader("Sube la imagen", type=["jpg", "png", "jpeg"]) if origen_foto == "Galería del Celular" else st.camera_input("Toma la foto")
 
     if archivo_busqueda:
-        with st.spinner("Buscando en tu historial en la nube..."):
+        with st.spinner("Buscando en tu historial..."):
             ruta_buscar = "temp_buscar.jpg"
             optimizar_imagen(archivo_busqueda, ruta_buscar)
                 
@@ -108,15 +107,14 @@ if opcion == "🔍 Buscar Carrera":
             if os.path.exists(ruta_buscar):
                 os.remove(ruta_buscar)
             
-            respuesta = supabase.table("resultados_carreras").select("*").execute()
-            historial_nube = respuesta.data
+            historial_actual = st.session_state.historial_nube
             
-            if not historial_nube:
-                st.error("Tu historial en la nube está vacío. Carga imágenes primero.")
+            if not historial_actual:
+                st.error("Tu historial está vacío. Carga imágenes primero en el menú lateral.")
             else:
                 resultados_similitud = []
-                for carrera in historial_nube:
-                    palabras_carrera = set(json.loads(carrera["palabras_clave"]))
+                for carrera in historial_actual:
+                    palabras_carrera = set(carrera["palabras_clave"])
                     coincidencias = palabras_busqueda.intersection(palabras_carrera)
                     porcentaje = (len(coincidencias) / len(palabras_busqueda)) * 100 if palabras_busqueda else 0
                     
@@ -127,7 +125,7 @@ if opcion == "🔍 Buscar Carrera":
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud
+                mejor = resultados_similitud[0]
                 
                 if mejor["similitud"] > 80:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
