@@ -80,18 +80,16 @@ if opcion == "📥 Cargar Historial":
                 except Exception:
                     pass
                 
-                # URL pública corregida limpia sin fragmentos extras de token
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # Guardar de forma ultra estable
+                # Guardar de forma ultra estable incluyendo la ruta local temporal
                 historial_actual.append({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
+                    "ruta_local": ruta_temp,
                     "palabras_clave": palabras_clave
                 })
                 
-                if os.path.exists(ruta_temp):
-                    os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
             
             st.success(f"¡{len(archivos_historial)} carreras de {tipo_animal} respaldadas exitosamente!")
@@ -107,7 +105,10 @@ elif opcion == "📋 Ver Historial Completo":
         st.write(f"Mostrando un total de **{len(historial_actual)}** carreras guardadas:")
         for elemento in historial_actual:
             with st.expander(f"🖼️ Archivo: {elemento['nombre_archivo']}"):
-                st.image(elemento['url_imagen'], use_container_width=True)
+                if "ruta_local" in elemento and os.path.exists(elemento["ruta_local"]):
+                    st.image(Image.open(elemento["ruta_local"]), use_container_width=True)
+                else:
+                    st.image(elemento['url_imagen'], use_container_width=True)
 
 # --- SECCIÓN: BUSCADOR ---
 elif opcion == "🔍 Buscar Carrera":
@@ -137,17 +138,25 @@ elif opcion == "🔍 Buscar Carrera":
                     resultados_similitud.append({
                         "nombre": carrera["nombre_archivo"],
                         "url": carrera["url_imagen"],
+                        "ruta_local": carrera.get("ruta_local", ""),
                         "similitud": porcentaje
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud
+                mejor = resultados_similitud[0] # Corrección: Extraer el primer elemento individualmente
                 
                 if mejor["similitud"] > 70:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
-                    st.image(mejor["url"], use_container_width=True)
+                    # Intentar abrir la imagen real almacenada localmente para garantizar visualización inmediata
+                    if mejor["ruta_local"] and os.path.exists(mejor["ruta_local"]):
+                        st.image(Image.open(mejor["ruta_local"]), use_container_width=True)
+                    else:
+                        st.image(mejor["url"], use_container_width=True)
                 else:
                     st.warning("No hay coincidencia exacta. Carreras más parecidas encontradas:")
                     for res in resultados_similitud[:3]:
                         with st.expander(f"📋 {res['nombre']} ({res['similitud']:.1f}%)"):
-                            st.image(res["url"], use_container_width=True)
+                            if res["ruta_local"] and os.path.exists(res["ruta_local"]):
+                                st.image(Image.open(res["ruta_local"]), use_container_width=True)
+                            else:
+                                st.image(res["url"], use_container_width=True)
