@@ -5,6 +5,7 @@ from PIL import Image
 import os
 import json
 import httpx
+from supabase import create_client, Client
 
 # Configuración de página móvil
 st.set_page_config(page_title="Historial Carreras", layout="centered")
@@ -13,6 +14,7 @@ st.title("🏁 Buscador de Carreras Multicategoría")
 # --- CONEXIÓN SEGURA A SUPABASE ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 nombre_bucket = "imagenes-carreras"
 
 # Carga optimizada del lector OCR
@@ -27,36 +29,35 @@ st.sidebar.header("⚙️ Configuración")
 tipo_animal = st.sidebar.radio("Selecciona el tipo de carrera:", ["🐕 Galgos", "🐎 Caballos"])
 opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historial Completo", "📥 Cargar Historial"])
 
-# Determinar archivos de respaldo según categoría
-archivo_db = "db_galgos.json" if tipo_animal == "🐕 Galgos" else "db_caballos.json"
+# Convertir el tipo de animal a un texto simple para la base de datos
+categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
-# --- FUNCIÓN: DESCARGAR BASE DE DATOS DESDE SUPABASE ---
-def cargar_base_datos():
-    url_descarga = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{archivo_db}"
+# --- FUNCIÓN: DESCARGAR HISTORIAL DESDE LA TABLA DE SUPABASE ---
+def cargar_historial_desde_tabla():
     try:
-        response = httpx.get(url_descarga)
-        if response.status_code == 200:
-            return response.json()
+        # Buscamos solo los registros que pertenezcan a la categoría seleccionada
+        respuesta = supabase.table("resultados_carreras").select("*").eq("nombre_archivo", categoria_actual).execute()
+        # Si la columna nombre_archivo guarda la categoría o la usamos de filtro
+        # Para no fallar con las columnas creadas, traeremos todo y filtramos en Python
+        respuesta = supabase.table("resultados_carreras").select("*").execute()
+        datos = respuesta.data
+        
+        # Filtramos para que solo muestre los de la categoría correcta usando el prefijo de la url
+        historial_filtrado = []
+        for item in datos:
+            # Validamos si la url contiene el prefijo del animal
+            if f"public/{nombre_bucket}/{categoria_actual}_" in item.get("url_imagen", ""):
+                historial_filtrado.append({
+                    "nombre_archivo": item.get("nombre_archivo", "carrera"),
+                    "url_imagen": item.get("url_imagen", ""),
+                    "palabras_clave": json.loads(item.get("palabras_clave", "[]"))
+                })
+        return historial_filtrado
     except Exception:
-        pass
-    return []
+        return []
 
-# --- FUNCIÓN: GUARDAR BASE DE DATOS EN SUPABASE ---
-def guardar_base_datos(datos):
-    url_upload_api = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{archivo_db}"
-    headers_api = {
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "apikey": SUPABASE_KEY,
-        "Content-Type": "application/json",
-        "x-upsert": "true"
-    }
-    try:
-        httpx.post(url_upload_api, headers=headers_api, content=json.dumps(datos))
-    except Exception:
-        pass
-
-# Cargar el historial correspondiente
-historial_actual = cargar_base_datos()
+# Cargar el historial filtrado en tiempo real
+historial_actual = cargar_historial_desde_tabla()
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
@@ -85,13 +86,12 @@ if opcion == "📥 Cargar Historial":
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir imagen a Supabase Storage
+                # Subir imagen a Supabase Storage via API HTTP directa
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
                 nombre_limpio = archivo.name.replace(" ", "_")
-                prefijo = "galgos_" if tipo_animal == "🐕 Galgos" else "caballos_"
-                url_upload_img = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{prefijo}{nombre_limpio}"
+                url_upload_img = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 headers_img = {
                     "Authorization": f"Bearer {SUPABASE_KEY}",
                     "apikey": SUPABASE_KEY,
@@ -101,23 +101,21 @@ if opcion == "📥 Cargar Historial":
                 with httpx.Client() as cliente:
                     cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
                 
-                # URL pública corregida para visualización en navegadores móviles
-                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{prefijo}{nombre_limpio}?token="
+                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # Añadir registro nuevo al historial cargado
-                historial_actual.append({
+                # GUARDAR DIRECTAMENTE EN LA TABLA DE SUPABASE
+                supabase.table("resultados_carreras").insert({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
-                    "palabras_clave": palabras_clave
-                })
+                    "palabras_clave": json.dumps(palabras_clave)
+                }).execute()
                 
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
             
-            # Guardar base de datos actualizada en Supabase de forma permanente
-            guardar_base_datos(historial_actual)
             st.success(f"¡{len(archivos_historial)} carreras de {tipo_animal} respaldadas exitosamente!")
+            st.rerun()
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -164,11 +162,11 @@ elif opcion == "🔍 Buscar Carrera":
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]
+                mejor = resultados_similitud
                 
                 if mejor["similitud"] > 80:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
-                    st.image(mejor["url"], caption=f"Historial {tipo_animal}: {mejor['nombre']}", use_container_width=True)
+                    st.image(mejor["url"], use_container_width=True)
                 else:
                     st.warning("No hay coincidencia exacta. Carreras más parecidas encontradas:")
                     for res in resultados_similitud[:3]:
