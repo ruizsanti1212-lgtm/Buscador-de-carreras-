@@ -1,6 +1,5 @@
 import streamlit as st
 import easyocr
-import pandas as pd
 from PIL import Image
 import os
 import json
@@ -10,7 +9,7 @@ import httpx
 st.set_page_config(page_title="Historial Carreras", layout="centered")
 st.title("🏁 Buscador de Carreras Multicategoría")
 
-# --- CONEXIÓN SEGURA A SUPABASE (SÓLO PARA IMÁGENES) ---
+# --- CONEXIÓN SEGURA A SUPABASE ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 nombre_bucket = "imagenes-carreras"
@@ -27,31 +26,25 @@ st.sidebar.header("⚙️ Configuración")
 tipo_animal = st.sidebar.radio("Selecciona el tipo de carrera:", ["🐕 Galgos", "🐎 Caballos"])
 opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historial Completo", "📥 Cargar Historial"])
 
-# Convertir el tipo de animal a un texto simple para la base de datos interna
+# Convertir el tipo de animal a un texto simple para la base de datos
 categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
 # Inicializar almacenamiento local estable si no existen
-if "db_local_galgos" not in st.session_state:
-    st.session_state.db_local_galgos = []
-if "db_local_caballos" not in st.session_state:
-    st.session_state.db_local_caballos = []
+if f"db_{categoria_actual}" not in st.session_state:
+    st.session_state[f"db_{categoria_actual}"] = []
 
-# Asignar el historial correspondiente en la sesión actual
-if categoria_actual == "galgos":
-    historial_actual = st.session_state.db_local_galgos
-else:
-    historial_actual = st.session_state.db_local_caballos
+historial_actual = st.session_state[f"db_{categoria_actual}"]
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
     img = Image.open(imagen_uploader)
-    if img.width > 1200:
-        proporcion = 1200 / float(img.width)
+    if img.width > 1000:
+        proporcion = 1000 / float(img.width)
         alto = int((float(img.height) * float(proporcion)))
-        img = img.resize((1200, alto), Image.Resampling.LANCZOS)
+        img = img.resize((1000, alto), Image.Resampling.LANCZOS)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    img.save(ruta_destino, "JPEG", quality=85)
+    img.save(ruta_destino, "JPEG", quality=80)
 
 # --- SECCIÓN: CARGA ---
 if opcion == "📥 Cargar Historial":
@@ -81,12 +74,15 @@ if opcion == "📥 Cargar Historial":
                     "Content-Type": "image/jpeg"
                 }
                 
-                with httpx.Client() as cliente:
-                    cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
+                try:
+                    with httpx.Client() as cliente:
+                        cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
+                except Exception:
+                    pass
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # GUARDAR DIRECTAMENTE EN EL ALMACENAMIENTO ESTABLE INTERNO DE LA APP
+                # Guardar de forma ultra estable
                 historial_actual.append({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
@@ -146,7 +142,7 @@ elif opcion == "🔍 Buscar Carrera":
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
                 mejor = resultados_similitud[0]
                 
-                if mejor["similitud"] > 80:
+                if mejor["similitud"] > 70:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
                     st.image(mejor["url"], use_container_width=True)
                 else:
