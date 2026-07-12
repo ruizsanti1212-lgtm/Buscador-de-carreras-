@@ -53,15 +53,13 @@ if opcion == "📥 Cargar Historial":
                 # Leer texto de la imagen (OCR)
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
-             
+                
                 # Subir la imagen optimizada a Supabase Storage (Método simplificado)
-with open(ruta_temp, "rb") as f:
-    supabase.storage.from_("imagenes-carreras").upload(
-        archivo.name, 
-        f, 
-        {"content-type": "image/jpeg"}
-    )
-
+                with open(ruta_temp, "rb") as f:
+                    supabase.storage.from_("imagenes-carreras").upload(
+                        archivo.name, 
+                        f, 
+                        {"content-type": "image/jpeg"}
                     )
                 
                 url_publica = supabase.storage.from_("imagenes-carreras").get_public_url(archivo.name)
