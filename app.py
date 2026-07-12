@@ -25,12 +25,10 @@ reader = cargar_ocr()
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
     img = Image.open(imagen_uploader)
-    # Si la imagen es muy grande, la reduce a un tamaño óptimo para OCR
     if img.width > 1200:
         proporcion = 1200 / float(img.width)
         alto = int((float(img.height) * float(proporcion)))
         img = img.resize((1200, alto), Image.Resampling.LANCZOS)
-    # Guarda la imagen en formato JPG comprimido
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
     img.save(ruta_destino, "JPEG", quality=85)
@@ -49,22 +47,21 @@ if opcion == "📥 Cargar Historial":
             for i, archivo in enumerate(archivos_historial):
                 ruta_temp = f"temp_{archivo.name}"
                 
-                # Optimizar antes de procesar para evitar caídas de memoria
+                # Optimizar antes de procesar
                 optimizar_imagen(archivo, ruta_temp)
                 
                 # Leer texto de la imagen (OCR)
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir la imagen optimizada a Supabase Storage
-with open(ruta_temp, "rb") as f:
-    archivo_bytes = f.read()
-    supabase.storage.from_("imagenes-carreras").upload(
-        path=archivo.name,
-        file=archivo_bytes,
-        file_options={"content-type": "image/jpeg"}
-    )
-
+                # Subir la imagen optimizada a Supabase Storage con formato moderno
+                with open(ruta_temp, "rb") as f:
+                    archivo_bytes = f.read()
+                    supabase.storage.from_("imagenes-carreras").upload(
+                        path=archivo.name,
+                        file=archivo_bytes,
+                        file_options={"content-type": "image/jpeg"}
+                    )
                 
                 url_publica = supabase.storage.from_("imagenes-carreras").get_public_url(archivo.name)
                 
