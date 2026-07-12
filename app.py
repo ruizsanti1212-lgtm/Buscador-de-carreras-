@@ -80,6 +80,7 @@ if opcion == "📥 Cargar Historial":
                 except Exception:
                     pass
                 
+                # URL pública corregida limpia sin fragmentos extras de token
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
                 # Guardar de forma ultra estable
@@ -140,7 +141,7 @@ elif opcion == "🔍 Buscar Carrera":
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]
+                mejor = resultados_similitud
                 
                 if mejor["similitud"] > 70:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
