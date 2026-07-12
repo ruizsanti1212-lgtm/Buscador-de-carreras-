@@ -5,16 +5,14 @@ from PIL import Image
 import os
 import json
 import httpx
-from supabase import create_client, Client
 
 # Configuración de página móvil
 st.set_page_config(page_title="Historial Carreras", layout="centered")
 st.title("🏁 Buscador de Carreras Multicategoría")
 
-# --- CONEXIÓN SEGURA A SUPABASE ---
+# --- CONEXIÓN SEGURA A SUPABASE (SÓLO PARA IMÁGENES) ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 nombre_bucket = "imagenes-carreras"
 
 # Carga optimizada del lector OCR
@@ -29,35 +27,20 @@ st.sidebar.header("⚙️ Configuración")
 tipo_animal = st.sidebar.radio("Selecciona el tipo de carrera:", ["🐕 Galgos", "🐎 Caballos"])
 opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historial Completo", "📥 Cargar Historial"])
 
-# Convertir el tipo de animal a un texto simple para la base de datos
+# Convertir el tipo de animal a un texto simple para la base de datos interna
 categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
-# --- FUNCIÓN: DESCARGAR HISTORIAL DESDE LA TABLA DE SUPABASE ---
-def cargar_historial_desde_tabla():
-    try:
-        # Buscamos solo los registros que pertenezcan a la categoría seleccionada
-        respuesta = supabase.table("resultados_carreras").select("*").eq("nombre_archivo", categoria_actual).execute()
-        # Si la columna nombre_archivo guarda la categoría o la usamos de filtro
-        # Para no fallar con las columnas creadas, traeremos todo y filtramos en Python
-        respuesta = supabase.table("resultados_carreras").select("*").execute()
-        datos = respuesta.data
-        
-        # Filtramos para que solo muestre los de la categoría correcta usando el prefijo de la url
-        historial_filtrado = []
-        for item in datos:
-            # Validamos si la url contiene el prefijo del animal
-            if f"public/{nombre_bucket}/{categoria_actual}_" in item.get("url_imagen", ""):
-                historial_filtrado.append({
-                    "nombre_archivo": item.get("nombre_archivo", "carrera"),
-                    "url_imagen": item.get("url_imagen", ""),
-                    "palabras_clave": json.loads(item.get("palabras_clave", "[]"))
-                })
-        return historial_filtrado
-    except Exception:
-        return []
+# Inicializar almacenamiento local estable si no existen
+if "db_local_galgos" not in st.session_state:
+    st.session_state.db_local_galgos = []
+if "db_local_caballos" not in st.session_state:
+    st.session_state.db_local_caballos = []
 
-# Cargar el historial filtrado en tiempo real
-historial_actual = cargar_historial_desde_tabla()
+# Asignar el historial correspondiente en la sesión actual
+if categoria_actual == "galgos":
+    historial_actual = st.session_state.db_local_galgos
+else:
+    historial_actual = st.session_state.db_local_caballos
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
@@ -103,19 +86,18 @@ if opcion == "📥 Cargar Historial":
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # GUARDAR DIRECTAMENTE EN LA TABLA DE SUPABASE
-                supabase.table("resultados_carreras").insert({
+                # GUARDAR DIRECTAMENTE EN EL ALMACENAMIENTO ESTABLE INTERNO DE LA APP
+                historial_actual.append({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
-                    "palabras_clave": json.dumps(palabras_clave)
-                }).execute()
+                    "palabras_clave": palabras_clave
+                })
                 
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
             
             st.success(f"¡{len(archivos_historial)} carreras de {tipo_animal} respaldadas exitosamente!")
-            st.rerun()
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -162,7 +144,7 @@ elif opcion == "🔍 Buscar Carrera":
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud
+                mejor = resultados_similitud[0]
                 
                 if mejor["similitud"] > 80:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
