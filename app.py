@@ -4,6 +4,7 @@ import pandas as pd
 from PIL import Image
 import os
 import json
+import httpx
 from supabase import create_client, Client
 
 # Configuración de página móvil
@@ -54,21 +55,29 @@ if opcion == "📥 Cargar Historial":
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir la imagen optimizada a Supabase Storage con formato binario nativo
+                # Subir la imagen optimizada a Supabase vía API HTTP directa (Evita fallos de la librería)
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
-                    
-                supabase.storage.from_("imagenes-carreras").upload(
-                    path=archivo.name,
-                    file=datos_binarios,
-                    file_options={"content-type": "image/jpeg"}
-                )
                 
-                url_publica = supabase.storage.from_("imagenes-carreras").get_public_url(archivo.name)
+                # Limpiar el nombre de archivo de caracteres raros o espacios
+                nombre_limpio = archivo.name.replace(" ", "_")
+                url_upload_api = f"{SUPABASE_URL}/storage/v1/object/imagenes-carreras/{nombre_limpio}"
+                headers_api = {
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "image/jpeg"
+                }
                 
-                # Guardar registro en la tabla
+                # Envío directo por HTTP POST
+                with httpx.Client() as cliente:
+                    response_upload = cliente.post(url_upload_api, headers=headers_api, content=datos_binarios)
+                
+                # Armamos la URL pública directamente
+                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/imagenes-carreras/{nombre_limpio}"
+                
+                # Guardar registro en la tabla de resultados
                 supabase.table("resultados_carreras").insert({
-                    "nombre_archivo": archivo.name,
+                    "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
                     "palabras_clave": json.dumps(palabras_clave)
                 }).execute()
@@ -118,7 +127,7 @@ if opcion == "🔍 Buscar Carrera":
                     })
                 
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]
+                mejor = resultados_similitud
                 
                 if mejor["similitud"] > 80:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
