@@ -15,11 +15,25 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Carga optimizada del lector OCR
 @st.cache_resource
 def cargar_ocr():
-    return easyocr.Reader(['es', 'en'])
+    return easyocr.Reader(['es', 'en'], gpu=False)
 
 reader = cargar_ocr()
+
+# Función para reducir el tamaño de la imagen y ahorrar memoria RAM
+def optimizar_imagen(imagen_uploader, ruta_destino):
+    img = Image.open(imagen_uploader)
+    # Si la imagen es muy grande, la reduce a un tamaño óptimo para OCR
+    if img.width > 1200:
+        proporcion = 1200 / float(img.width)
+        alto = int((float(img.height) * float(proporcion)))
+        img = img.resize((1200, alto), Image.Resampling.LANCZOS)
+    # Guarda la imagen en formato JPG comprimido
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    img.save(ruta_destino, "JPEG", quality=85)
 
 # --- MENÚ MÓVIL ---
 opcion = st.sidebar.radio("Ir a:", ["🔍 Buscar Carrera", "📥 Cargar Historial"])
@@ -34,24 +48,29 @@ if opcion == "📥 Cargar Historial":
             progreso = st.progress(0)
             for i, archivo in enumerate(archivos_historial):
                 ruta_temp = f"temp_{archivo.name}"
-                with open(ruta_temp, "wb") as f:
-                    f.write(archivo.getbuffer())
                 
+                # Optimizar antes de procesar para evitar caídas de memoria
+                optimizar_imagen(archivo, ruta_temp)
+                
+                # Leer texto de la imagen (OCR)
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
+                # Subir la imagen optimizada a Supabase Storage
                 with open(ruta_temp, "rb") as f:
                     supabase.storage.from_("imagenes-carreras").upload(archivo.name, f)
                 
                 url_publica = supabase.storage.from_("imagenes-carreras").get_public_url(archivo.name)
                 
+                # Guardar registro en la tabla
                 supabase.table("resultados_carreras").insert({
                     "nombre_archivo": archivo.name,
                     "url_imagen": url_publica,
                     "palabras_clave": json.dumps(palabras_clave)
                 }).execute()
                 
-                os.remove(ruta_temp)
+                if os.path.exists(ruta_temp):
+                    os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
                 
             st.success(f"¡{len(archivos_historial)} carreras respaldadas en la nube!")
@@ -68,12 +87,13 @@ if opcion == "🔍 Buscar Carrera":
     if archivo_busqueda:
         with st.spinner("Buscando en tu historial en la nube..."):
             ruta_buscar = "temp_buscar.jpg"
-            with open(ruta_buscar, "wb") as f:
-                f.write(archivo_busqueda.getbuffer())
+            optimizar_imagen(archivo_busqueda, ruta_buscar)
                 
             textos_busqueda = reader.readtext(ruta_buscar, detail=0)
             palabras_busqueda = set([t.lower().strip() for t in textos_busqueda])
-            os.remove(ruta_buscar)
+            
+            if os.path.exists(ruta_buscar):
+                os.remove(ruta_buscar)
             
             respuesta = supabase.table("resultados_carreras").select("*").execute()
             historial_nube = respuesta.data
