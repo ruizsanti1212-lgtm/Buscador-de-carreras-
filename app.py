@@ -79,7 +79,7 @@ if opcion == "📥 Cargar Historial":
                 supabase.table("resultados_carreras").insert({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
-                    "palabras_clave": json.dumps(palabras_clave)
+                    
                 }).execute()
                 
                 if os.path.exists(ruta_temp):
