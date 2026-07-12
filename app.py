@@ -48,7 +48,7 @@ def guardar_base_datos(datos):
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
-        "x-upsert": "true"  # Permite sobreescribir el archivo viejo
+        "x-upsert": "true"
     }
     try:
         httpx.post(url_upload_api, headers=headers_api, content=json.dumps(datos))
@@ -101,7 +101,8 @@ if opcion == "📥 Cargar Historial":
                 with httpx.Client() as cliente:
                     cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
                 
-                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{prefijo}{nombre_limpio}"
+                # URL pública corregida para visualización en navegadores móviles
+                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{prefijo}{nombre_limpio}?token="
                 
                 # Añadir registro nuevo al historial cargado
                 historial_actual.append({
