@@ -13,6 +13,7 @@ st.title("🏁 Buscador de Carreras Multicategoría")
 # --- CONEXIÓN SEGURA A SUPABASE ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+nombre_bucket = "imagenes-carreras"
 
 # Carga optimizada del lector OCR
 @st.cache_resource
@@ -21,11 +22,41 @@ def cargar_ocr():
 
 reader = cargar_ocr()
 
-# Inicializar las dos bases de datos locales separadas en el servidor
-if "historial_galgos" not in st.session_state:
-    st.session_state.historial_galgos = []
-if "historial_caballos" not in st.session_state:
-    st.session_state.historial_caballos = []
+# --- MENÚ MÓVIL EN LA BARRA LATERAL ---
+st.sidebar.header("⚙️ Configuración")
+tipo_animal = st.sidebar.radio("Selecciona el tipo de carrera:", ["🐕 Galgos", "🐎 Caballos"])
+opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historial Completo", "📥 Cargar Historial"])
+
+# Determinar archivos de respaldo según categoría
+archivo_db = "db_galgos.json" if tipo_animal == "🐕 Galgos" else "db_caballos.json"
+
+# --- FUNCIÓN: DESCARGAR BASE DE DATOS DESDE SUPABASE ---
+def cargar_base_datos():
+    url_descarga = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{archivo_db}"
+    try:
+        response = httpx.get(url_descarga)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return []
+
+# --- FUNCIÓN: GUARDAR BASE DE DATOS EN SUPABASE ---
+def guardar_base_datos(datos):
+    url_upload_api = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{archivo_db}"
+    headers_api = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "x-upsert": "true"  # Permite sobreescribir el archivo viejo
+    }
+    try:
+        httpx.post(url_upload_api, headers=headers_api, content=json.dumps(datos))
+    except Exception:
+        pass
+
+# Cargar el historial correspondiente
+historial_actual = cargar_base_datos()
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
@@ -38,19 +69,6 @@ def optimizar_imagen(imagen_uploader, ruta_destino):
         img = img.convert("RGB")
     img.save(ruta_destino, "JPEG", quality=85)
 
-# --- MENÚ MÓVIL EN LA BARRA LATERAL ---
-st.sidebar.header("⚙️ Configuración")
-tipo_animal = st.sidebar.radio("Selecciona el tipo de carrera:", ["🐕 Galgos", "🐎 Caballos"])
-opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📥 Cargar Historial"])
-
-# Asignar la base de datos correcta según la selección
-if tipo_animal == "🐕 Galgos":
-    historial_actual = st.session_state.historial_galgos
-    nombre_bucket = "imagenes-carreras" # Mantenemos tu bucket por defecto
-else:
-    historial_actual = st.session_state.historial_caballos
-    nombre_bucket = "imagenes-carreras"
-
 # --- SECCIÓN: CARGA ---
 if opcion == "📥 Cargar Historial":
     st.header(f"📥 Guardar en Historial de {tipo_animal}")
@@ -61,34 +79,31 @@ if opcion == "📥 Cargar Historial":
             progreso = st.progress(0)
             for i, archivo in enumerate(archivos_historial):
                 ruta_temp = f"temp_{archivo.name}"
-                
-                # Optimizar antes de procesar
                 optimizar_imagen(archivo, ruta_temp)
                 
                 # Leer texto de la imagen (OCR)
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir la imagen optimizada a Supabase Storage vía API HTTP directa
+                # Subir imagen a Supabase Storage
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
                 nombre_limpio = archivo.name.replace(" ", "_")
-                # Se agrega un prefijo al nombre en la nube para identificar el animal en el mismo storage
                 prefijo = "galgos_" if tipo_animal == "🐕 Galgos" else "caballos_"
-                url_upload_api = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{prefijo}{nombre_limpio}"
-                headers_api = {
+                url_upload_img = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{prefijo}{nombre_limpio}"
+                headers_img = {
                     "Authorization": f"Bearer {SUPABASE_KEY}",
                     "apikey": SUPABASE_KEY,
                     "Content-Type": "image/jpeg"
                 }
                 
                 with httpx.Client() as cliente:
-                    cliente.post(url_upload_api, headers=headers_api, content=datos_binarios)
+                    cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{prefijo}{nombre_limpio}"
                 
-                # Guardar el registro en la memoria estable correspondiente
+                # Añadir registro nuevo al historial cargado
                 historial_actual.append({
                     "nombre_archivo": nombre_limpio,
                     "url_imagen": url_publica,
@@ -98,15 +113,27 @@ if opcion == "📥 Cargar Historial":
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 progreso.progress((i + 1) / len(archivos_historial))
-                
+            
+            # Guardar base de datos actualizada en Supabase de forma permanente
+            guardar_base_datos(historial_actual)
             st.success(f"¡{len(archivos_historial)} carreras de {tipo_animal} respaldadas exitosamente!")
         else:
             st.warning("Selecciona archivos primero.")
 
+# --- SECCIÓN: VER HISTORIAL ---
+elif opcion == "📋 Ver Historial Completo":
+    st.header(f"📋 Galería de Carreras de {tipo_animal}")
+    if not historial_actual:
+        st.info(f"Aún no hay carreras guardadas en la categoría de {tipo_animal}.")
+    else:
+        st.write(f"Mostrando un total de **{len(historial_actual)}** carreras guardadas:")
+        for elemento in historial_actual:
+            with st.expander(f"🖼️ Archivo: {elemento['nombre_archivo']}"):
+                st.image(elemento['url_imagen'], use_container_width=True)
+
 # --- SECCIÓN: BUSCADOR ---
-if opcion == "🔍 Buscar Carrera":
+elif opcion == "🔍 Buscar Carrera":
     st.header(f"🔍 Buscar en Historial de {tipo_animal}")
-    
     origen_foto = st.radio("Origen de la imagen:", ["Galería del Celular", "Cámara del Celular"])
     archivo_busqueda = st.file_uploader("Sube la imagen", type=["jpg", "png", "jpeg"]) if origen_foto == "Galería del Celular" else st.camera_input("Toma la foto")
 
@@ -117,7 +144,6 @@ if opcion == "🔍 Buscar Carrera":
                 
             textos_busqueda = reader.readtext(ruta_buscar, detail=0)
             palabras_busqueda = set([t.lower().strip() for t in textos_busqueda])
-            
             if os.path.exists(ruta_buscar):
                 os.remove(ruta_buscar)
             
