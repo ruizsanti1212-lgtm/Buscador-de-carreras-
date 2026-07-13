@@ -36,7 +36,7 @@ opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historia
 # Convertir el tipo de animal a un texto simple para la base de datos
 categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
-# --- FUNCIONES DE BASE DE DATOS (SUPABASE CORRECCIÓN DE PERSISTENCIA) ---
+# --- FUNCIONES DE BASE DE DATOS ---
 def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave):
     """Guarda permanentemente el registro en la base de datos de Supabase."""
     url_db = f"{SUPABASE_URL}/rest/v1/historial_carreras"
@@ -44,7 +44,7 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
         "categoria": categoria,
         "nombre_archivo": nombre_archivo,
         "url_imagen": url_imagen,
-        "palabras_clave": palabras_clave  # Postgres acepta listas directamente como arreglos
+        "palabras_clave": palabras_clave
     }
     try:
         with httpx.Client() as cliente:
@@ -55,7 +55,7 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
         return False
 
 def cargar_historial_desde_base_datos(categoria):
-    """Descarga los registros en tiempo real desde Supabase sin depender de la RAM."""
+    """Descarga los registros en tiempo real desde Supabase."""
     url_db = f"{SUPABASE_URL}/rest/v1/historial_carreras?categoria=eq.{categoria}&select=*"
     try:
         with httpx.Client() as cliente:
@@ -66,10 +66,10 @@ def cargar_historial_desde_base_datos(categoria):
         st.error(f"Error al descargar historial: {e}")
     return []
 
-# Obtener historial real de internet en vez de session_state
+# Obtener historial real de internet
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
-# Función para reducir el tamaño de la imagen y ahorrar memoria RAM
+# Función para reducir el tamaño de la imagen
 def optimizar_imagen(imagen_uploader, ruta_destino):
     img = Image.open(imagen_uploader)
     if img.width > 1000:
@@ -88,7 +88,7 @@ if opcion == "📥 Cargar Historial":
     if st.button("Procesar y Guardar Permanentemente", use_container_width=True):
         if archivos_historial:
             progreso = st.progress(0)
-            exitos guardados = 0
+            exitos_guardados = 0
             
             for i, archivo in enumerate(archivos_historial):
                 ruta_temp = f"temp_{archivo.name}"
@@ -98,7 +98,7 @@ if opcion == "📥 Cargar Historial":
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir imagen a Supabase Storage via API HTTP directa
+                # Subir imagen a Supabase Storage
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
@@ -118,20 +118,19 @@ if opcion == "📥 Cargar Historial":
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # GUARDADO PERMANENTE EN LA BASE DE DATOS
+                # GUARDADO PERMANENTE
                 guardado_exitoso = guardar_en_base_datos(categoria_actual, nombre_limpio, url_publica, palabras_clave)
                 
                 if guardado_exitoso:
-                    exitos guardados += 1
+                    exitos_guardados += 1
                 
-                # Borrar archivo temporal local
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 
                 progreso.progress((i + 1) / len(archivos_historial))
             
-            st.success(f"¡{exitos guardados} carreras de {tipo_animal} respaldadas en la nube permanentemente!")
-            st.rerun()  # Forzar refresco para ver los cambios inmediatamente
+            st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas permanentemente!")
+            st.rerun()
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -141,7 +140,7 @@ elif opcion == "📋 Ver Historial Completo":
     if not historial_actual:
         st.info(f"Aún no hay carreras guardadas en la nube para {tipo_animal}.")
     else:
-        st.write(f"Mostrando un total de **{len(historial_actual)}** carreras recuperadas de la base de datos:")
+        st.write(f"Mostrando un total de **{len(historial_actual)}** carreras recuperadas:")
         for elemento in historial_actual:
             with st.expander(f"🖼️ Archivo: {elemento['nombre_archivo']}"):
                 st.image(elemento['url_imagen'], use_container_width=True)
@@ -163,7 +162,7 @@ elif opcion == "🔍 Buscar Carrera":
                 os.remove(ruta_buscar)
             
             if not historial_actual:
-                st.error(f"Tu historial de {tipo_animal} está vacío en la base de datos. Carga imágenes primero.")
+                st.error(f"Tu historial de {tipo_animal} está vacío en la base de datos.")
             else:
                 resultados_similitud = []
                 for carrera in historial_actual:
@@ -180,7 +179,7 @@ elif opcion == "🔍 Buscar Carrera":
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
                 mejor = resultados_similitud[0]
                 
-                if mejor["similitud"] > 50:  # Umbral optimizado a 50% por variaciones de luz en celulares
+                if mejor["similitud"] > 50:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
                     st.image(mejor["url"], use_container_width=True)
                 else:
