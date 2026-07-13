@@ -4,3 +4,4 @@ pandas
 pillow
 supabase
 httpx
+supabase
