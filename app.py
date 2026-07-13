@@ -2,7 +2,6 @@ import streamlit as st
 import easyocr
 from PIL import Image
 import os
-import json
 import httpx
 
 # Configuración de página móvil
@@ -49,10 +48,13 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
     try:
         with httpx.Client() as cliente:
             respuesta = cliente.post(url_db, headers=HEADERS_BASE, json=payload)
-            # Retorna True si se guardó correctamente (Códigos 200, 201 o 204)
-            return respuesta.status_code in [200, 201, 204]
+            if respuesta.status_code < 300:
+                return True
+            else:
+                st.error(f"Error en tabla Supabase: {respuesta.status_code} - {respuesta.text}")
+                return False
     except Exception as e:
-        st.error(f"Error al conectar con la base de datos: {e}")
+        st.error(f"Error de conexión con la base de datos: {e}")
         return False
 
 def cargar_historial_desde_base_datos(categoria):
@@ -67,14 +69,16 @@ def cargar_historial_desde_base_datos(categoria):
             respuesta = cliente.get(url_db, headers=headers_get)
             if respuesta.status_code == 200:
                 return respuesta.json()
+            else:
+                st.error(f"Error al descargar base de datos: {respuesta.status_code}")
     except Exception as e:
-        st.error(f"Error al descargar historial: {e}")
+        st.error(f"Error de conexión al cargar historial: {e}")
     return []
 
-# Obtener historial real de internet de forma persistente
+# Obtener historial de forma persistente desde la nube
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
-# Función para reducir el tamaño de la imagen y ahorrar RAM
+# Función para reducir el tamaño de la imagen y ahorrar memoria RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
     img = Image.open(imagen_uploader)
     if img.width > 1000:
@@ -96,18 +100,17 @@ if opcion == "📥 Cargar Historial":
             exitos_guardados = 0
             
             for i, archivo in enumerate(archivos_historial):
-                # Generar un nombre limpio único para evitar conflictos de archivos
                 nombre_limpio = archivo.name.replace(" ", "_")
                 ruta_temp = f"temp_{nombre_limpio}"
                 
-                # Crear y optimizar el archivo local antes de procesarlo
+                # Optimizar imagen localmente
                 optimizar_imagen(archivo, ruta_temp)
                 
                 # Leer texto de la imagen (OCR)
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Subir imagen a Supabase Storage
+                # Leer archivo binario para la subida
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
@@ -118,11 +121,17 @@ if opcion == "📥 Cargar Historial":
                     "Content-Type": "image/jpeg"
                 }
                 
+                # Subir imagen a Supabase Storage
+                subida_storage_ok = False
                 try:
                     with httpx.Client() as cliente:
-                        cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
+                        res_storage = cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
+                        if res_storage.status_code < 300:
+                            subida_storage_ok = True
+                        else:
+                            st.error(f"Error en almacenamiento Supabase: {res_storage.status_code} - {res_storage.text}")
                 except Exception as e:
-                    st.error(f"Error al subir imagen al almacenamiento: {e}")
+                    st.error(f"Error de red en almacenamiento: {e}")
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
@@ -132,14 +141,17 @@ if opcion == "📥 Cargar Historial":
                 if guardado_exitoso:
                     exitos_guardados += 1
                 
-                # Eliminar rigurosamente el archivo temporal para evitar fallos de FileNotFoundError
+                # Eliminar el archivo temporal local de forma segura
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 
                 progreso.progress((i + 1) / len(archivos_historial))
             
-            st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas permanentemente en la nube!")
-            st.rerun()
+            if exitos_guardados > 0:
+                st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas en la nube permanentemente!")
+                st.rerun()
+            else:
+                st.error("No se pudo guardar la información. Revisa los mensajes de error mostrados.")
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -188,7 +200,7 @@ elif opcion == "🔍 Buscar Carrera":
                 
                 # Ordenar de mayor a menor coincidencia
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]  # Extraer el primer elemento de forma correcta
+                mejor = resultados_similitud[0]  # CORREGIDO: Extrae el elemento con mayor coincidencia de manera segura
                 
                 if mejor["similitud"] > 50:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
