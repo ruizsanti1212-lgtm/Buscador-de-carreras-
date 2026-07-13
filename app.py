@@ -2,6 +2,7 @@ import streamlit as st
 import easyocr
 from PIL import Image
 import os
+import datetime
 from supabase import create_client, Client
 
 # Configuración de página móvil
@@ -83,7 +84,9 @@ if opcion == "📥 Cargar Historial":
             exitos_guardados = 0
             
             for i, archivo in enumerate(archivos_historial):
-                nombre_limpio = archivo.name.replace(" ", "_")
+                # Crear prefijo único usando el tiempo para evitar que se bloquee por nombres idénticos
+                marca_tiempo = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                nombre_limpio = f"{marca_tiempo}_{archivo.name.replace(' ', '_')}"
                 ruta_temp = f"temp_{nombre_limpio}"
                 
                 optimizar_imagen(archivo, ruta_temp)
@@ -100,7 +103,7 @@ if opcion == "📥 Cargar Historial":
                             file_options={"content-type": "image/jpeg", "x-upsert": "true"}
                         )
                 except Exception as e:
-                    st.error(f"Error en Supabase Storage: {e}")
+                    st.error(f"Error en Supabase Storage (Asegúrate de que el bucket sea público): {e}")
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{ruta_almacenamiento}"
                 
