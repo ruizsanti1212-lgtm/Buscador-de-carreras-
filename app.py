@@ -3,8 +3,8 @@ import easyocr
 from PIL import Image
 import os
 import uuid
-import gc  # Liberador de memoria del sistema
-import time
+import gc
+import threading  # LIBRERÍA CLAVE: Para ejecutar la subida en segundo plano
 from difflib import SequenceMatcher
 from supabase import create_client, Client
 
@@ -26,16 +26,16 @@ try:
 except Exception as e:
     st.error(f"Error al inicializar las credenciales de Supabase: {e}")
 
-# Carga e inicialización optimizada del lector OCR
+# Inicialización optimizada del motor OCR
 @st.cache_resource
 def cargar_ocr():
     return easyocr.Reader(['es', 'en'], gpu=False)
 
-reader = cargar_ocr()
-
-# --- CONTROL DE ESTADO (SOLUCIÓN AL BLOQUEO DE SUBIDAS) ---
+# Inicializar llaves de control en segundo plano
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = str(uuid.uuid4())
+if "tareas_activas" not in st.session_state:
+    st.session_state["tareas_activas"] = []
 
 # --- MENÚ EN LA BARRA LATERAL ---
 st.sidebar.header("⚙️ Configuración")
@@ -55,11 +55,9 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
         }
         supabase.table("historial_carreras").insert(datos).execute()
         return True
-    except Exception as e:
-        st.error(f"Error al insertar datos: {e}")
+    except:
         return False
 
-@st.cache_data(ttl=60)  # Almacena en caché el historial durante 1 minuto para optimizar rendimiento
 def cargar_historial_desde_base_datos(categoria):
     try:
         respuesta = supabase.table("historial_carreras").select("*").eq("categoria", categoria).execute()
@@ -69,21 +67,17 @@ def cargar_historial_desde_base_datos(categoria):
 
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
-# --- COMPRESIÓN ULTRA RÁPIDA DE IMÁGENES ---
-def optimizar_imagen_rapido(imagen_uploader, ruta_destino):
-    """Reduce drásticamente el tamaño para que el OCR procese en milisegundos."""
-    img = Image.open(imagen_uploader)
-    # Reducimos a 800px de ancho (suficiente para pantallas y mucho más rápido de procesar)
-    if img.width > 800:
-        proporcion = 800 / float(img.width)
+def optimizar_imagen_rapido(imagen_bytes, ruta_destino):
+    """Procesa la imagen directamente desde la memoria RAM."""
+    img = Image.open(imagen_bytes)
+    if img.width > 600: 
+        proporcion = 600 / float(img.width)
         alto = int((float(img.height) * float(proporcion)))
-        img = img.resize((800, alto), Image.Resampling.LANCZOS)
+        img = img.resize((600, alto), Image.Resampling.LANCZOS)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    # Bajamos la calidad a 70% (el texto sigue siendo legible pero el archivo pesa la mitad)
-    img.save(ruta_destino, "JPEG", quality=70, optimize=True)
+    img.save(ruta_destino, "JPEG", quality=60, optimize=True)
 
-# --- PROCESADOR FILTRADO DE TEXTO PANTALLA ---
 def limpiar_y_extraer_datos_pantalla(textos_ocr):
     datos_utiles = []
     palabras_basura = {
@@ -103,11 +97,64 @@ def limpiar_y_extraer_datos_pantalla(textos_ocr):
 def calcular_similitud_texto(str1, str2):
     return SequenceMatcher(None, str1, str2).ratio()
 
-# --- SECCIÓN: CARGA MASIVA CON AUTO-LIMPIEZA Y ESTADOS ---
+# --- FUNCIÓN TRABAJADORA EN SEGUNDO PLANO (BACKGROUND THREAD) ---
+def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket):
+    """Ejecuta de forma invisible el OCR, compresión y subida a Supabase sin tocar la pantalla."""
+    client_local = create_client(url_sb, key_sb)
+    reader_local = easyocr.Reader(['es', 'en'], gpu=False)
+    
+    for archivo in lista_archivos:
+        id_unico = uuid.uuid4().hex[:8]
+        nombre_limpio = f"{id_unico}_{archivo['name'].replace(' ', '_')}"
+        ruta_temp = f"temp_{nombre_limpio}"
+        
+        try:
+            # Optimizar desde el volcado de bytes guardado
+            optimizar_imagen_rapido(archivo["bytes"], ruta_temp)
+            
+            # Ejecutar el OCR pesado de forma oculta
+            textos = reader_local.readtext(ruta_temp, detail=0)
+            datos_limpios = limpiar_y_extraer_datos_pantalla(textos)
+            
+            ruta_almacenamiento = f"{categoria}_{nombre_limpio}"
+            
+            with open(ruta_temp, "rb") as f:
+                client_local.storage.from_(bucket).upload(
+                    path=ruta_almacenamiento,
+                    file=f,
+                    file_options={"content-type": "image/jpeg", "x-upsert": "true"}
+                )
+            
+            url_publica = f"{url_sb}/storage/v1/object/public/{bucket}/{ruta_almacenamiento}"
+            
+            # Insertar en base de datos
+            datos_db = {
+                "categoria": categoria,
+                "nombre_archivo": nombre_limpio,
+                "url_imagen": url_publica,
+                "palabras_clave": datos_limpios
+            }
+            client_local.table("historial_carreras").insert(datos_db).execute()
+            
+        except:
+            pass
+        finally:
+            if os.path.exists(ruta_temp):
+                os.remove(ruta_temp)
+                
+    gc.collect()
+
+# --- SECCIÓN: CARGA MASIVA EN SEGUNDO PLANO ---
 if opcion == "📥 Cargar Historial":
     st.header(f"📥 Guardar Resultados Finales de {tipo_animal}")
     
-    # El componente usa una clave dinámica que podemos resetear para blanquear el cuadro
+    # Notificación persistente si hay tareas corriendo de fondo
+    if st.session_state["tareas_activas"]:
+        # Filtrar hilos que ya terminaron su labor
+        st.session_state["tareas_activas"] = [t for t in st.session_state["tareas_activas"] if t.is_alive()]
+        if st.session_state["tareas_activas"]:
+            st.warning("⚙️ **Hay subidas procesándose de fondo.** Puedes seguir usando la app con normalidad.")
+            
     archivos_historial = st.file_uploader(
         "Selecciona fotos de resultados finales:", 
         accept_multiple_files=True, 
@@ -115,97 +162,62 @@ if opcion == "📥 Cargar Historial":
         key=st.session_state["uploader_key"]
     )
     
-    if st.button("Procesar y Guardar Todo", use_container_width=True):
+    if archivos_historial:
+        st.info(f"📂 ¡{len(archivos_historial)} imágenes listas para enviar al segundo plano!")
+
+    if st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
         if archivos_historial:
-            total_archivos = len(archivos_historial)
-            exitos_guardados = 0
+            # Clonar los archivos en memoria para que no desaparezcan al limpiar el cargador
+            archivos_clonados = []
+            for a in archivos_historial:
+                archivos_clonados.append({
+                    "name": a.name,
+                    "bytes": a  # Streamlit maneja los archivos subidos como BytesIO nativos
+                })
             
-            # Contenedores visuales dinámicos
-            zona_alerta = st.empty()
-            zona_progreso = st.empty()
-            zona_texto = st.empty()
+            # Crear y arrancar el hilo secundario invisible
+            hilo = threading.Thread(
+                target=tarea_subida_segundo_plano,
+                args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket)
+            )
+            hilo.start()
             
-            # Mensaje en AZUL para el proceso de análisis y subida
-            zona_alerta.info(f"⏳ **Procesando e indexando {total_archivos} imágenes... Por favor, no cierres la app.**")
+            # Guardar registro del hilo para monitorear su estado
+            st.session_state["tareas_activas"].append(hilo)
             
-            for i, archivo in enumerate(archivos_historial):
-                zona_texto.caption(f"📦 Analizando y subiendo: `{archivo.name}`")
-                zona_progreso.progress((i + 1) / total_archivos)
-                
-                id_unico = uuid.uuid4().hex[:8]
-                nombre_limpio = f"{id_unico}_{archivo.name.replace(' ', '_')}"
-                ruta_temp = f"temp_{nombre_limpio}"
-                
-                optimizar_imagen_rapido(archivo, ruta_temp)
-                
-                textos_detectados = reader.readtext(ruta_temp, detail=0)
-                palabras_clave = limpiar_y_extraer_datos_pantalla(textos_detectados)
-                
-                ruta_almacenamiento = f"{categoria_actual}_{nombre_limpio}"
-                try:
-                    with open(ruta_temp, "rb") as f:
-                        supabase.storage.from_(nombre_bucket).upload(
-                            path=ruta_almacenamiento,
-                            file=f,
-                            file_options={"content-type": "image/jpeg", "x-upsert": "true"}
-                        )
-                    
-                    url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{ruta_almacenamiento}"
-                    guardado_exitoso = guardar_en_base_datos(categoria_actual, nombre_limpio, url_publica, palabras_clave)
-                    
-                    if guardado_exitoso:
-                        exitos_guardados += 1
-                except Exception as e:
-                    st.error(f"❌ Error al subir {archivo.name}: {e}")
-                finally:
-                    if os.path.exists(ruta_temp):
-                        os.remove(ruta_temp)
+            # AUTO-LIMPIEZA INMEDIATA: Desaparecen los archivos del cuadro gris instantáneamente
+            st.session_state["uploader_key"] = str(uuid.uuid4())
             
-            # Liberar memoria RAM residual inmediatamente
-            gc.collect()
-            
-            # Limpiar elementos temporales de la pantalla
-            zona_texto.empty()
-            zona_progreso.empty()
-            
-            if exitos_guardados > 0:
-                # Alerta final en VERDE
-                zona_alerta.success(f"✅ ¡Se han subido y procesado exitosamente {exitos_guardados} de {total_archivos} carreras!")
-                
-                # AUTO-LIMPIEZA: Cambiar el ID del uploader elimina las fotos del cuadro gris al instante
-                st.session_state["uploader_key"] = str(uuid.uuid4())
-                
-                st.cache_data.clear()  # Forzar actualización inmediata del historial
-                time.sleep(2.5)        # Pausa para que el usuario aprecie el estado verde
-                st.rerun()
-            else:
-                zona_alerta.error("❌ No se pudo procesar ninguna imagen correctamente.")
+            st.success("✅ **¡Imágenes enviadas al segundo plano con éxito!** El cuadro se ha vaciado y ya puedes cambiar de menú o realizar búsquedas mientras el servidor procesa tus fotos.")
+            time.sleep(1.5)
+            st.rerun()
         else:
-            st.warning("⚠️ Por favor, selecciona al menos un archivo antes de presionar el botón.")
+            st.warning("⚠️ Selecciona primero los archivos de tu galería.")
 
 # --- SECCIÓN: VER HISTORIAL ---
 elif opcion == "📋 Ver Historial Completo":
     st.header(f"📋 Historial de Resultados Finales")
+    if st.session_state["tareas_activas"]:
+        st.caption("🔄 *Nota: Algunas imágenes podrían estar indexándose en este momento de fondo.*")
+        
     if not historial_actual:
         st.info(f"Aún no hay carreras registradas.")
     else:
         st.write(f"Total: **{len(historial_actual)}** registros.")
         for elemento in historial_actual:
-            with st.expander(f"🖼 *{elemento['nombre_archivo']}*"):
+            with st.expander(f"🖼️ *{elemento['nombre_archivo']}*"):
                 st.image(elemento['url_imagen'], use_container_width=True)
-                if elemento['palabras_clave']:
-                    st.caption(f"Datos Guardados: {', '.join(elemento['palabras_clave'])}")
 
 # --- SECCIÓN: BUSCADOR POR COMBINACIÓN DE 6 CORREDORES ---
 elif opcion == "🔍 Buscar Carrera":
     st.header(f"🔍 Verificar Combinación de 6 Corredores")
-    st.write("Sube la foto del inicio de la carrera para comprobar si se repiten los mismos 6 corredores con sus mismas cuotas.")
     
     origen_foto = st.radio("Origen de la imagen:", ["Galería del Celular", "Cámara del Celular"])
     archivo_busqueda = st.file_uploader("Sube la foto de la tabla de inicio", type=["jpg", "png", "jpeg"]) if origen_foto == "Galería del Celular" else st.camera_input("Toma la foto")
     
     if archivo_busqueda:
         with st.spinner(f"Analizando los 6 corredores y sus cuotas..."):
+            reader = cargar_ocr()
             ruta_buscar = "temp_buscar.jpg"
             optimizar_imagen_rapido(archivo_busqueda, ruta_buscar)
             textos_busqueda = reader.readtext(ruta_buscar, detail=0)
@@ -221,6 +233,8 @@ elif opcion == "🔍 Buscar Carrera":
             carrera_repetida = None
             max_corredores_coincidentes = 0
             
-            # Recorremos el historial buscando coincidencias del bloque de corredores
             for carrera in historial_actual:
                 palabras_carrera = carrera["palabras_clave"]
+                coincidencias_estrictas = 0
+                
+                for p_carrera in palabras_carrera:
