@@ -2,23 +2,26 @@ import streamlit as st
 import easyocr
 from PIL import Image
 import os
-import httpx
+from supabase import create_client, Client
 
 # Configuración de página móvil
 st.set_page_config(page_title="Historial Carreras", layout="centered")
 st.title("🏁 Buscador de Carreras Multicategoría")
 
-# --- CONEXIÓN SEGURA A SUPABASE ---
+# --- CONEXIÓN SEGURA Y OFICIAL A SUPABASE ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 nombre_bucket = "imagenes-carreras"
 
-# Headers globales para la API de Supabase
-HEADERS_BASE = {
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "apikey": SUPABASE_KEY,
-    "Content-Type": "application/json"
-}
+# Inicializar el cliente oficial para evitar errores 401 de cabeceras
+@st.cache_resource
+def inicializar_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+try:
+    supabase: Client = inicializar_supabase()
+except Exception as e:
+    st.error(f"Error al inicializar las credenciales de Supabase: {e}")
 
 # Carga optimizada del lector OCR
 @st.cache_resource
@@ -37,45 +40,30 @@ categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
 # --- FUNCIONES DE BASE DE DATOS ---
 def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave):
-    """Guarda permanentemente el registro en la base de datos de Supabase."""
-    url_db = f"{SUPABASE_URL}/rest/v1/historial_carreras"
-    payload = {
-        "categoria": categoria,
-        "nombre_archivo": nombre_archivo,
-        "url_imagen": url_imagen,
-        "palabras_clave": palabras_clave
-    }
+    """Guarda permanentemente el registro utilizando el cliente oficial."""
     try:
-        with httpx.Client() as cliente:
-            respuesta = cliente.post(url_db, headers=HEADERS_BASE, json=payload)
-            if respuesta.status_code < 300:
-                return True
-            else:
-                st.error(f"Error en tabla Supabase: {respuesta.status_code} - {respuesta.text}")
-                return False
+        datos = {
+            "categoria": categoria,
+            "nombre_archivo": nombre_archivo,
+            "url_imagen": url_imagen,
+            "palabras_clave": palabras_clave
+        }
+        respuesta = supabase.table("historial_carreras").insert(datos).execute()
+        return True
     except Exception as e:
-        st.error(f"Error de conexión con la base de datos: {e}")
+        st.error(f"Error al insertar datos en la tabla (Verifica las credenciales en st.secrets): {e}")
         return False
 
 def cargar_historial_desde_base_datos(categoria):
-    """Descarga los registros en tiempo real desde Supabase."""
-    url_db = f"{SUPABASE_URL}/rest/v1/historial_carreras?categoria=eq.{categoria}&select=*"
+    """Descarga los registros utilizando el cliente oficial."""
     try:
-        with httpx.Client() as cliente:
-            headers_get = {
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "apikey": SUPABASE_KEY
-            }
-            respuesta = cliente.get(url_db, headers=headers_get)
-            if respuesta.status_code == 200:
-                return respuesta.json()
-            else:
-                st.error(f"Error al descargar base de datos: {respuesta.status_code}")
+        respuesta = supabase.table("historial_carreras").select("*").eq("categoria", categoria).execute()
+        return respuesta.data
     except Exception as e:
-        st.error(f"Error de conexión al cargar historial: {e}")
-    return []
+        st.error(f"Error de autenticación o conexión 401 (Verifica tu SUPABASE_KEY y URL): {e}")
+        return []
 
-# Obtener historial de forma persistente desde la nube
+# Obtener historial real de forma persistente desde la nube
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
 # Función para reducir el tamaño de la imagen y ahorrar memoria RAM
@@ -110,32 +98,23 @@ if opcion == "📥 Cargar Historial":
                 textos_detectados = reader.readtext(ruta_temp, detail=0)
                 palabras_clave = [t.lower().strip() for t in textos_detectados]
                 
-                # Leer archivo binario para la subida
-                with open(ruta_temp, "rb") as f:
-                    datos_binarios = f.read()
-                
-                url_upload_img = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
-                headers_img = {
-                    "Authorization": f"Bearer {SUPABASE_KEY}",
-                    "apikey": SUPABASE_KEY,
-                    "Content-Type": "image/jpeg"
-                }
-                
-                # Subir imagen a Supabase Storage
+                # Subir imagen a Supabase Storage usando el cliente oficial
+                ruta_almacenamiento = f"{categoria_actual}_{nombre_limpio}"
                 subida_storage_ok = False
                 try:
-                    with httpx.Client() as cliente:
-                        res_storage = cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
-                        if res_storage.status_code < 300:
-                            subida_storage_ok = True
-                        else:
-                            st.error(f"Error en almacenamiento Supabase: {res_storage.status_code} - {res_storage.text}")
+                    with open(ruta_temp, "rb") as f:
+                        supabase.storage.from_(nombre_bucket).upload(
+                            path=ruta_almacenamiento,
+                            file=f,
+                            file_options={"content-type": "image/jpeg", "x-upsert": "true"}
+                        )
+                    subida_storage_ok = True
                 except Exception as e:
-                    st.error(f"Error de red en almacenamiento: {e}")
+                    st.error(f"Error en almacenamiento Supabase Storage: {e}")
                 
-                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
+                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{ruta_almacenamiento}"
                 
-                # GUARDADO PERMANENTE EN LA BASE DE DATOS
+                # GUARDADO PERMANENTE EN LA TABLA
                 guardado_exitoso = guardar_en_base_datos(categoria_actual, nombre_limpio, url_publica, palabras_clave)
                 
                 if guardado_exitoso:
@@ -150,8 +129,6 @@ if opcion == "📥 Cargar Historial":
             if exitos_guardados > 0:
                 st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas en la nube permanentemente!")
                 st.rerun()
-            else:
-                st.error("No se pudo guardar la información. Revisa los mensajes de error mostrados.")
         else:
             st.warning("Selecciona archivos primero.")
 
@@ -200,7 +177,7 @@ elif opcion == "🔍 Buscar Carrera":
                 
                 # Ordenar de mayor a menor coincidencia
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]  # CORREGIDO: Extrae el elemento con mayor coincidencia de manera segura
+                mejor = resultados_similitud[0]
                 
                 if mejor["similitud"] > 50:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
