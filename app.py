@@ -49,7 +49,8 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
     try:
         with httpx.Client() as cliente:
             respuesta = cliente.post(url_db, headers=HEADERS_BASE, json=payload)
-            return respuesta.status_code in [200, 201]
+            # Retorna True si se guardó correctamente (Códigos 200, 201 o 204)
+            return respuesta.status_code in [200, 201, 204]
     except Exception as e:
         st.error(f"Error al conectar con la base de datos: {e}")
         return False
@@ -59,17 +60,21 @@ def cargar_historial_desde_base_datos(categoria):
     url_db = f"{SUPABASE_URL}/rest/v1/historial_carreras?categoria=eq.{categoria}&select=*"
     try:
         with httpx.Client() as cliente:
-            respuesta = cliente.get(url_db, headers={k: v for k, v in HEADERS_BASE.items() if k != "Content-Type"})
+            headers_get = {
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "apikey": SUPABASE_KEY
+            }
+            respuesta = cliente.get(url_db, headers=headers_get)
             if respuesta.status_code == 200:
                 return respuesta.json()
     except Exception as e:
         st.error(f"Error al descargar historial: {e}")
     return []
 
-# Obtener historial real de internet
+# Obtener historial real de internet de forma persistente
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
-# Función para reducir el tamaño de la imagen
+# Función para reducir el tamaño de la imagen y ahorrar RAM
 def optimizar_imagen(imagen_uploader, ruta_destino):
     img = Image.open(imagen_uploader)
     if img.width > 1000:
@@ -91,7 +96,11 @@ if opcion == "📥 Cargar Historial":
             exitos_guardados = 0
             
             for i, archivo in enumerate(archivos_historial):
-                ruta_temp = f"temp_{archivo.name}"
+                # Generar un nombre limpio único para evitar conflictos de archivos
+                nombre_limpio = archivo.name.replace(" ", "_")
+                ruta_temp = f"temp_{nombre_limpio}"
+                
+                # Crear y optimizar el archivo local antes de procesarlo
                 optimizar_imagen(archivo, ruta_temp)
                 
                 # Leer texto de la imagen (OCR)
@@ -102,7 +111,6 @@ if opcion == "📥 Cargar Historial":
                 with open(ruta_temp, "rb") as f:
                     datos_binarios = f.read()
                 
-                nombre_limpio = archivo.name.replace(" ", "_")
                 url_upload_img = f"{SUPABASE_URL}/storage/v1/object/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 headers_img = {
                     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -113,23 +121,24 @@ if opcion == "📥 Cargar Historial":
                 try:
                     with httpx.Client() as cliente:
                         cliente.post(url_upload_img, headers=headers_img, content=datos_binarios)
-                except Exception:
-                    pass
+                except Exception as e:
+                    st.error(f"Error al subir imagen al almacenamiento: {e}")
                 
                 url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{nombre_bucket}/{categoria_actual}_{nombre_limpio}"
                 
-                # GUARDADO PERMANENTE
+                # GUARDADO PERMANENTE EN LA BASE DE DATOS
                 guardado_exitoso = guardar_en_base_datos(categoria_actual, nombre_limpio, url_publica, palabras_clave)
                 
                 if guardado_exitoso:
                     exitos_guardados += 1
                 
+                # Eliminar rigurosamente el archivo temporal para evitar fallos de FileNotFoundError
                 if os.path.exists(ruta_temp):
                     os.remove(ruta_temp)
                 
                 progreso.progress((i + 1) / len(archivos_historial))
             
-            st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas permanentemente!")
+            st.success(f"¡{exitos_guardados} carreras de {tipo_animal} respaldadas permanentemente en la nube!")
             st.rerun()
         else:
             st.warning("Selecciona archivos primero.")
@@ -158,11 +167,12 @@ elif opcion == "🔍 Buscar Carrera":
                 
             textos_busqueda = reader.readtext(ruta_buscar, detail=0)
             palabras_busqueda = set([t.lower().strip() for t in textos_busqueda])
+            
             if os.path.exists(ruta_buscar):
                 os.remove(ruta_buscar)
             
             if not historial_actual:
-                st.error(f"Tu historial de {tipo_animal} está vacío en la base de datos.")
+                st.error(f"Tu historial de {tipo_animal} está vacío en la base de datos. Carga imágenes primero.")
             else:
                 resultados_similitud = []
                 for carrera in historial_actual:
@@ -176,8 +186,9 @@ elif opcion == "🔍 Buscar Carrera":
                         "similitud": porcentaje
                     })
                 
+                # Ordenar de mayor a menor coincidencia
                 resultados_similitud = sorted(resultados_similitud, key=lambda x: x["similitud"], reverse=True)
-                mejor = resultados_similitud[0]
+                mejor = resultados_similitud[0]  # Extraer el primer elemento de forma correcta
                 
                 if mejor["similitud"] > 50:
                     st.success(f"🎯 ¡Carrera encontrada! Similitud: {mejor['similitud']:.1f}%")
