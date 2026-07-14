@@ -7,6 +7,7 @@ import gc
 import threading  
 import time  
 import io
+import re
 from difflib import SequenceMatcher
 from supabase import create_client, Client
 
@@ -35,7 +36,6 @@ def cargar_ocr():
 
 reader_compartido = cargar_ocr()
 
-# Inicializar llaves de control en segundo plano
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = str(uuid.uuid4())
 if "tareas_activas" not in st.session_state:
@@ -49,19 +49,6 @@ opcion = st.sidebar.radio("Acción:", ["🔍 Buscar Carrera", "📋 Ver Historia
 categoria_actual = "galgos" if tipo_animal == "🐕 Galgos" else "caballos"
 
 # --- FUNCIONES DE BASE DE DATOS ---
-def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave):
-    try:
-        datos = {
-            "categoria": categoria,
-            "nombre_archivo": nombre_archivo,
-            "url_imagen": url_imagen,
-            "palabras_clave": palabras_clave
-        }
-        supabase.table("historial_carreras").insert(datos).execute()
-        return True
-    except:
-        return False
-
 def cargar_historial_desde_base_datos(categoria):
     try:
         respuesta = supabase.table("historial_carreras").select("*").eq("categoria", categoria).order("id", descending=True).execute()
@@ -72,7 +59,6 @@ def cargar_historial_desde_base_datos(categoria):
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
 def optimizar_imagen_rapido(raw_bytes, ruta_destino):
-    """Procesa la imagen directamente desde los bytes guardados de forma segura en memoria."""
     img = Image.open(io.BytesIO(raw_bytes))
     if img.width > 600: 
         proporcion = 600 / float(img.width)
@@ -82,28 +68,61 @@ def optimizar_imagen_rapido(raw_bytes, ruta_destino):
         img = img.convert("RGB")
     img.save(ruta_destino, "JPEG", quality=60, optimize=True)
 
-def limpiar_y_extraer_datos_pantalla(textos_ocr):
-    datos_utiles = []
-    palabras_basura = {
-        "ganador", "segundo", "tercero", "gemela", "trio", "rev", "reversible", 
-        "juego", "resultados", "finalizado", "carrera", "de", "caballos", "galgos",
-        "colores", "calidos"
-    }
-    for t in textos_ocr:
-        texto = t.strip().lower()
-        if len(texto) < 2 or texto in palabras_basura or texto.endswith("s."):
+def procesar_y_vincular_filas(resultados_ocr):
+    """
+    Agrupa los textos por altura en el eje Y para asociar nombres y cuotas,
+    omitiendo el carril físico para evitar variaciones espaciales.
+    """
+    filas_agrupadas = {}
+    tolerancia_y = 15  
+    
+    for (bbox, texto, prob) in resultados_ocr:
+        texto_limpio = texto.strip().lower()
+        if len(texto_limpio) < 1:
             continue
-        if any(char.isdigit() for char in texto):
-            texto = texto.replace('o', '0').replace('i', '1')
-        datos_utiles.append(texto)
-    return list(set(datos_utiles))
+            
+        centro_y = (bbox[0][1] + bbox[2][1]) / 2
+        
+        fila_encontrada = False
+        for y_existente in filas_agrupadas.keys():
+            if abs(centro_y - y_existente) < tolerancia_y:
+                filas_agrupadas[y_existente].append((bbox[0][0], texto_limpio))
+                fila_encontrada = True
+                break
+        
+        if not fila_encontrada:
+            filas_agrupadas[centro_y] = [(bbox[0][0], texto_limpio)]
+            
+    huellas_corredores = []
+    palabras_basura = {"ganador", "segundo", "tercero", "juego", "resultados", "finalizado", "carrera", "de", "caballos", "galgos", "ultimos", "valoracion", "gana", "segu", "terce", "estado"}
+    
+    for y in sorted(filas_agrupadas.keys()):
+        elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x[0])
+        textos_fila = [item[1] for item in elementos_fila if item[1] not in palabras_basura]
+        
+        cuota = "0.0"
+        nombres = []
+        
+        for t in textos_fila:
+            if t in ["1", "2", "3", "4", "5", "6"]:
+                continue  
+            elif bool(re.match(r'^\d+[\.,]\d+$', t)):
+                cuota = t.replace(',', '.')
+            else:
+                if len(t) > 2 and not any(c.isdigit() for c in t):
+                    nombres.append(t)
+                    
+        if nombres:
+            nombre_completo = " ".join(nombres)
+            huellas_corredores.append(f"{nombre_completo}_{cuota}")
+            
+    return list(set(huellas_corredores))
 
 def calcular_similitud_texto(str1, str2):
     return SequenceMatcher(None, str1, str2).ratio()
 
-# --- FUNCIÓN TRABAJADORA EN SEGUNDO PLANO (BACKGROUND THREAD) ---
+# --- FUNCIÓN EN SEGUNDO PLANO ---
 def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket):
-    """Ejecuta el OCR de forma aislada, compresión y subida a Supabase sin interferir en la UI."""
     client_local = create_client(url_sb, key_sb)
     reader_local = easyocr.Reader(['es', 'en'], gpu=False)
     
@@ -113,15 +132,11 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
         ruta_temp = f"temp_{nombre_limpio}"
         
         try:
-            # Procesar los bytes clonados inmunes al ciclo de vida de Streamlit
             optimizar_imagen_rapido(archivo["data"], ruta_temp)
-            
-            # Ejecución OCR
-            textos = reader_local.readtext(ruta_temp, detail=0)
-            datos_limpios = limpiar_y_extraer_datos_pantalla(textos)
+            resultados_raw = reader_local.readtext(ruta_temp, detail=1)
+            datos_huella = procesar_y_vincular_filas(resultados_raw)
             
             ruta_almacenamiento = f"{categoria}_{nombre_limpio}"
-            
             with open(ruta_temp, "rb") as f:
                 client_local.storage.from_(bucket).upload(
                     path=ruta_almacenamiento,
@@ -130,119 +145,98 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
                 )
             
             url_publica = f"{url_sb}/storage/v1/object/public/{bucket}/{ruta_almacenamiento}"
-            
             datos_db = {
                 "categoria": categoria,
                 "nombre_archivo": nombre_limpio,
                 "url_imagen": url_publica,
-                "palabras_clave": datos_limpios
+                "palabras_clave": datos_huella
             }
             client_local.table("historial_carreras").insert(datos_db).execute()
-            
         except:
             pass
         finally:
             if os.path.exists(ruta_temp):
                 os.remove(ruta_temp)
-                
     gc.collect()
 
-# --- SECCIÓN: CARGA MASIVA EN SEGUNDO PLANO ---
+# --- SECCIÓN: CARGA MASIVA ---
 if opcion == "📥 Cargar Historial":
-    st.header(f"📥 Guardar Resultados Finales de {tipo_animal}")
-    
+    st.header(f"📥 Guardar Resultados Finales")
     if st.session_state["tareas_activas"]:
         st.session_state["tareas_activas"] = [t for t in st.session_state["tareas_activas"] if t.is_alive()]
         if st.session_state["tareas_activas"]:
-            st.warning("⚙️ **Hay subidas procesándose de fondo.** Puedes seguir usando la app con normalidad.")
+            st.warning("⚙️ **Hay subidas procesándose de fondo.**")
             
-    archivos_historial = st.file_uploader(
-        "Selecciona fotos de resultados finales:", 
-        accept_multiple_files=True, 
-        type=["jpg", "png", "jpeg"],
-        key=st.session_state["uploader_key"]
-    )
+    archivos_historial = st.file_uploader("Selecciona fotos de resultados finales:", accept_multiple_files=True, type=["jpg", "png", "jpeg"], key=st.session_state["uploader_key"])
     
-    if archivos_historial:
-        st.info(f"📂 ¡{len(archivos_historial)} imágenes listas para enviar al segundo plano!")
-
-    if st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
-        if archivos_historial:
-            archivos_clonados = []
-            for a in archivos_historial:
-                # Extraemos los bytes crudos inmediatamente para evitar pérdidas de datos al refrescar
-                archivos_clonados.append({
-                    "name": a.name,
-                    "data": a.read()  
-                })
-            
-            hilo = threading.Thread(
-                target=tarea_subida_segundo_plano,
-                args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket)
-            )
-            hilo.start()
-            
-            st.session_state["tareas_activas"].append(hilo)
-            st.session_state["uploader_key"] = str(uuid.uuid4())
-            
-            st.success("✅ **¡Imágenes enviadas al segundo plano con éxito!**")
-            time.sleep(1.5)
-            st.rerun()
-        else:
-            st.warning("⚠️ Selecciona primero los archivos de tu galería.")
+    if archivos_historial and st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
+        archivos_clonados = [{"name": a.name, "data": a.read()} for a in archivos_historial]
+        hilo = threading.Thread(target=tarea_subida_segundo_plano, args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket))
+        hilo.start()
+        st.session_state["tareas_activas"].append(hilo)
+        st.session_state["uploader_key"] = str(uuid.uuid4())
+        st.success("✅ ¡Imágenes enviadas al segundo plano con éxito!")
+        time.sleep(1.5)
+        st.rerun()
 
 # --- SECCIÓN: VER HISTORIAL ---
 elif opcion == "📋 Ver Historial Completo":
-    st.header(f"📋 Historial de Resultados Finales ({tipo_animal})")
-    if st.session_state["tareas_activas"]:
-        st.caption("🔄 *Nota: Algunas imágenes podrían estar indexándose en este momento de fondo.*")
-        
+    st.header(f"📋 Historial ({tipo_animal})")
     if not historial_actual:
-        st.info(f"Aún no hay carreras registradas en esta categoría.")
+        st.info(f"Aún no hay carreras registradas.")
     else:
         for item in historial_actual:
             with st.container(border=True):
                 st.image(item["url_imagen"], use_container_width=True)
-                tags = ", ".join(item["palabras_clave"]) if item["palabras_clave"] else "Sin etiquetas"
-                st.caption(f"🔑 **Datos detectados:** {tags}")
+                st.caption(f"🔑 **Huellas de Corredores Guardadas:**")
+                st.write(", ".join([t.replace('_', ' (Cuota: ') + ')' for t in item['palabras_clave']]).title())
 
 # --- SECCIÓN: BUSCAR CARRERA ---
 elif opcion == "🔍 Buscar Carrera":
-    st.header(f"🔍 Buscador Inteligente ({tipo_animal})")
+    st.header(f"🔍 Diagnóstico de Similitud Avanzado ({tipo_animal})")
     
-    termino_busqueda = st.text_input("Introduce el nombre del ejemplar, número o pista:", "").strip().lower()
-    
-    if termino_busqueda:
-        resultados_encontrados = []
+    metodo_busqueda = st.sidebar.radio("Método de búsqueda:", ["📸 Foto en Vivo", "⌨️ Texto Manual"])
+    huellas_actuales = []
+
+    if metodo_busqueda == "📸 Foto en Vivo":
+        foto_busqueda = st.file_uploader("Sube la foto de la pantalla actual/en vivo:", type=["jpg", "png", "jpeg"])
+        if foto_busqueda:
+            with st.spinner("Analizando corredores y cuotas del mercado..."):
+                ruta_busqueda_temp = f"temp_busqueda_{uuid.uuid4().hex[:4]}.jpg"
+                optimizar_imagen_rapido(foto_busqueda.read(), ruta_busqueda_temp)
+                
+                resultados_raw = reader_compartido.readtext(ruta_busqueda_temp, detail=1)
+                huellas_actuales = procesar_y_vincular_filas(resultados_raw)
+                
+                if os.path.exists(ruta_busqueda_temp):
+                    os.remove(ruta_busqueda_temp)
+                
+                if huellas_actuales:
+                    st.info("📋 **Corredores y cuotas detectados en vivo:**")
+                    for h in huellas_actuales:
+                        st.write(f"🔹 {h.replace('_', ' ➡️ Cuota: ').title()}")
+                else:
+                    st.warning("⚠️ No se pudieron aislar combinaciones válidas.")
+    else:
+        nombre_manual = st.text_input("Nombre del ejemplar:", "").strip().lower()
+        cuota_manual = st.text_input("Cuota aproximada (ej: 4.28):", "0.0").strip().lower()
+        if nombre_manual:
+            huellas_actuales = [f"{nombre_manual}_{cuota_manual}"]
+
+    # --- ALGORITMO INTEGRAL ---
+    if huellas_actuales:
+        lista_similitudes = []
+        coincidencias_exactas_100 = []
         
         for item in historial_actual:
-            coincidencia_alta = False
-            max_similitud = 0.0
+            clones_perfectos = 0
+            solo_nombre = 0
             
-            for palabra in item["palabras_clave"]:
-                if termino_busqueda in palabra:
-                    coincidencia_alta = True
-                    break
+            for h_actual in huellas_actuales:
+                partes_act = h_actual.split("_")
                 
-                similitud = calcular_similitud_texto(termino_busqueda, palabra)
-                if similitud > max_similitud:
-                    max_similitud = similitud
-            
-            if coincidencia_alta or max_similitud >= 0.75:
-                # Almacenamos la tupla con el valor numérico para poder ordenar de forma segura
-                resultados_encontrados.append((item, max_similitud if not coincidencia_alta else 1.0))
-        
-        # Ordenamos usando explícitamente el índice numérico [1] (el puntaje de similitud)
-        resultados_encontrados.sort(key=lambda x: x[1], reverse=True)
-        
-        if resultados_encontrados:
-            st.success(f"✨ Se encontraron {len(resultados_encontrados)} resultados posibles:")
-            for res, score in resultados_encontrados:
-                with st.container(border=True):
-                    st.image(res["url_imagen"], use_container_width=True)
-                    tags = ", ".join(res["palabras_clave"])
-                    st.caption(f"🔑 **Datos detectados:** {tags}")
-                    if score < 1.0 and score > 0.0:
-                        st.caption(f"🎯 *Precisión de coincidencia: {int(score * 100)}%*")
-        else:
-            st.warning("❌ No se encontraron registros que coincidan con tu búsqueda.")
+                for h_historial in item["palabras_clave"]:
+                    partes_hist = h_historial.split("_")
+                    
+                    if len(partes_act) == 2 and len(partes_hist) == 2:
+                        sim_nombre = calcular_similitud_texto(partes_act, partes_hist)
