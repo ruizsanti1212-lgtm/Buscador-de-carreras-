@@ -70,8 +70,8 @@ def optimizar_imagen_rapido(raw_bytes, ruta_destino):
 
 def procesar_y_vincular_filas(resultados_ocr):
     """
-    Filtra y agrupa los textos leídos aplicando reglas estrictas.
-    Busca únicamente líneas que contengan la estructura de un corredor válido.
+    Agrupa los textos por altura en el eje Y para asociar nombres y cuotas,
+    omitiendo el carril físico para evitar variaciones espaciales.
     """
     filas_agrupadas = {}
     tolerancia_y = 12  
@@ -81,7 +81,6 @@ def procesar_y_vincular_filas(resultados_ocr):
         if len(texto_limpio) < 1:
             continue
             
-        # Corregir errores comunes de lectura del OCR en números decimales
         if any(c.isdigit() for c in texto_limpio) and ('.' in texto_limpio or ',' in texto_limpio):
             texto_limpio = texto_limpio.replace('o', '0').replace('i', '1').replace('s', '5').replace(',', '.')
 
@@ -90,47 +89,37 @@ def procesar_y_vincular_filas(resultados_ocr):
         fila_encontrada = False
         for y_existente in filas_agrupadas.keys():
             if abs(centro_y - y_existente) < tolerancia_y:
-                filas_agrupadas[y_existente].append((bbox[0][0], texto_limpio))
+                filas_agrupadas[y_existente].append((bbox, texto_limpio))
                 fila_encontrada = True
                 break
         
         if not fila_encontrada:
-            filas_agrupadas[centro_y] = [(bbox[0][0], texto_limpio)]
+            filas_agrupadas[centro_y] = [(bbox, texto_limpio)]
             
     huellas_corredores = []
     
     for y in sorted(filas_agrupadas.keys()):
-        # Ordenar de izquierda a derecha (Eje X)
-        elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x[0])
+        elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x[0][0])
         textos_fila = [item[1] for item in elementos_fila]
         
-        puesto_carril = None
         cuota = None
         palabras_nombre = []
         
         for t in textos_fila:
-            # 1. Identificar Puesto (un solo dígito aislado del 1 al 6)
-            if t in ["1", "2", "3", "4", "5", "6"] and puesto_carril is None:
-                puesto_carril = t
+            if t in ["1", "2", "3", "4", "5", "6"]:
                 continue
             
-            # 2. Identificar Cuota (número con punto decimal ej: 2.51, 10.5, 4.28)
             if bool(re.match(r'^\d+\.\d+$', t)) and cuota is None:
                 cuota = t
                 continue
                 
-            # 3. Agrupar nombres válidos (ignorar jockeys en segunda línea si el OCR los separó de altura)
             if len(t) > 2 and not any(c.isdigit() for c in t):
-                # Descartar palabras del sistema o títulos de columnas de la interfaz
                 if t in ["ganador", "segundo", "tercero", "juego", "resultados", "finalizado", "carrera", "caballos", "galgos", "ultimos", "valoracion", "gana", "segu", "terce", "estado", "pista"]:
                     continue
                 palabras_nombre.append(t)
         
-        # 🚨 FILTRO RADICAL CRÍTICO: Para registrar un corredor legítimo, obligatoriamente
-        # debe haberse detectado un nombre válido en la línea.
         if palabras_nombre:
             nombre_completo = " ".join(palabras_nombre)
-            # Si el OCR no leyó la cuota de esa línea, le asignamos un marcador por defecto para evitar rupturas
             cuota_final = cuota if cuota else "0.0"
             huellas_corredores.append(f"{nombre_completo}_{cuota_final}")
             
@@ -234,3 +223,23 @@ elif opcion == "🔍 Buscar Carrera":
                     os.remove(ruta_busqueda_temp)
                 
                 if huellas_actuales:
+                    st.info("📋 **Corredores y cuotas legítimos detectados en vivo:**")
+                    for h in huellas_actuales:
+                        st.write(f"🔹 {h.replace('_', ' ➡️ Cuota: ').title()}")
+                else:
+                    st.warning("⚠️ No se pudieron aislar filas de competidores válidas. Asegúrate de enfocar bien la lista central.")
+
+        if huellas_actuales:
+            lista_similitudes = []
+            coincidencias_exactas_100 = []
+            
+            for item in historial_actual:
+                clones_perfectos = 0
+                solo_nombre = 0
+                
+                for h_actual in huellas_actuales:
+                    partes_act = h_actual.split("_")
+                    
+                    for h_historial in item["palabras_clave"]:
+                        partes_hist = h_historial.split("_")
+                        
