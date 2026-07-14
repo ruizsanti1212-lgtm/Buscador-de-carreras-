@@ -70,17 +70,21 @@ def optimizar_imagen_rapido(raw_bytes, ruta_destino):
 
 def procesar_y_vincular_filas(resultados_ocr):
     """
-    Agrupa los textos por altura en el eje Y para asociar nombres y cuotas,
-    omitiendo el carril físico para evitar variaciones espaciales.
+    Filtra y agrupa los textos leídos aplicando reglas estrictas.
+    Busca únicamente líneas que contengan la estructura de un corredor válido.
     """
     filas_agrupadas = {}
-    tolerancia_y = 15  
+    tolerancia_y = 12  
     
     for (bbox, texto, prob) in resultados_ocr:
         texto_limpio = texto.strip().lower()
         if len(texto_limpio) < 1:
             continue
             
+        # Corregir errores comunes de lectura del OCR en números decimales
+        if any(c.isdigit() for c in texto_limpio) and ('.' in texto_limpio or ',' in texto_limpio):
+            texto_limpio = texto_limpio.replace('o', '0').replace('i', '1').replace('s', '5').replace(',', '.')
+
         centro_y = (bbox[0][1] + bbox[2][1]) / 2
         
         fila_encontrada = False
@@ -94,27 +98,41 @@ def procesar_y_vincular_filas(resultados_ocr):
             filas_agrupadas[centro_y] = [(bbox[0][0], texto_limpio)]
             
     huellas_corredores = []
-    palabras_basura = {"ganador", "segundo", "tercero", "juego", "resultados", "finalizado", "carrera", "de", "caballos", "galgos", "ultimos", "valoracion", "gana", "segu", "terce", "estado"}
     
     for y in sorted(filas_agrupadas.keys()):
+        # Ordenar de izquierda a derecha (Eje X)
         elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x[0])
-        textos_fila = [item[1] for item in elementos_fila if item[1] not in palabras_basura]
+        textos_fila = [item[1] for item in elementos_fila]
         
-        cuota = "0.0"
-        nombres = []
+        puesto_carril = None
+        cuota = None
+        palabras_nombre = []
         
         for t in textos_fila:
-            if t in ["1", "2", "3", "4", "5", "6"]:
-                continue  
-            elif bool(re.match(r'^\d+[\.,]\d+$', t)):
-                cuota = t.replace(',', '.')
-            else:
-                if len(t) > 2 and not any(c.isdigit() for c in t):
-                    nombres.append(t)
-                    
-        if nombres:
-            nombre_completo = " ".join(nombres)
-            huellas_corredores.append(f"{nombre_completo}_{cuota}")
+            # 1. Identificar Puesto (un solo dígito aislado del 1 al 6)
+            if t in ["1", "2", "3", "4", "5", "6"] and puesto_carril is None:
+                puesto_carril = t
+                continue
+            
+            # 2. Identificar Cuota (número con punto decimal ej: 2.51, 10.5, 4.28)
+            if bool(re.match(r'^\d+\.\d+$', t)) and cuota is None:
+                cuota = t
+                continue
+                
+            # 3. Agrupar nombres válidos (ignorar jockeys en segunda línea si el OCR los separó de altura)
+            if len(t) > 2 and not any(c.isdigit() for c in t):
+                # Descartar palabras del sistema o títulos de columnas de la interfaz
+                if t in ["ganador", "segundo", "tercero", "juego", "resultados", "finalizado", "carrera", "caballos", "galgos", "ultimos", "valoracion", "gana", "segu", "terce", "estado", "pista"]:
+                    continue
+                palabras_nombre.append(t)
+        
+        # 🚨 FILTRO RADICAL CRÍTICO: Para registrar un corredor legítimo, obligatoriamente
+        # debe haberse detectado un nombre válido en la línea.
+        if palabras_nombre:
+            nombre_completo = " ".join(palabras_nombre)
+            # Si el OCR no leyó la cuota de esa línea, le asignamos un marcador por defecto para evitar rupturas
+            cuota_final = cuota if cuota else "0.0"
+            huellas_corredores.append(f"{nombre_completo}_{cuota_final}")
             
     return list(set(huellas_corredores))
 
@@ -195,13 +213,17 @@ elif opcion == "📋 Ver Historial Completo":
 elif opcion == "🔍 Buscar Carrera":
     st.header(f"🔍 Diagnóstico de Similitud Avanzado ({tipo_animal})")
     
-    metodo_busqueda = st.sidebar.radio("Método de búsqueda:", ["📸 Foto en Vivo", "⌨️ Texto Manual"])
+    metodo_busqueda = st.sidebar.radio(
+        "Método de búsqueda:", 
+        ["📸 Foto en Vivo (Parrilla completa)", "⌨️ Buscar un Corredor específico"]
+    )
+    
     huellas_actuales = []
 
-    if metodo_busqueda == "📸 Foto en Vivo":
+    if metodo_busqueda == "📸 Foto en Vivo (Parrilla completa)":
         foto_busqueda = st.file_uploader("Sube la foto de la pantalla actual/en vivo:", type=["jpg", "png", "jpeg"])
         if foto_busqueda:
-            with st.spinner("Analizando corredores y cuotas del mercado..."):
+            with st.spinner("Filtrando y decodificando la tabla de cuotas..."):
                 ruta_busqueda_temp = f"temp_busqueda_{uuid.uuid4().hex[:4]}.jpg"
                 optimizar_imagen_rapido(foto_busqueda.read(), ruta_busqueda_temp)
                 
@@ -212,31 +234,3 @@ elif opcion == "🔍 Buscar Carrera":
                     os.remove(ruta_busqueda_temp)
                 
                 if huellas_actuales:
-                    st.info("📋 **Corredores y cuotas detectados en vivo:**")
-                    for h in huellas_actuales:
-                        st.write(f"🔹 {h.replace('_', ' ➡️ Cuota: ').title()}")
-                else:
-                    st.warning("⚠️ No se pudieron aislar combinaciones válidas.")
-    else:
-        nombre_manual = st.text_input("Nombre del ejemplar:", "").strip().lower()
-        cuota_manual = st.text_input("Cuota aproximada (ej: 4.28):", "0.0").strip().lower()
-        if nombre_manual:
-            huellas_actuales = [f"{nombre_manual}_{cuota_manual}"]
-
-    # --- ALGORITMO INTEGRAL ---
-    if huellas_actuales:
-        lista_similitudes = []
-        coincidencias_exactas_100 = []
-        
-        for item in historial_actual:
-            clones_perfectos = 0
-            solo_nombre = 0
-            
-            for h_actual in huellas_actuales:
-                partes_act = h_actual.split("_")
-                
-                for h_historial in item["palabras_clave"]:
-                    partes_hist = h_historial.split("_")
-                    
-                    if len(partes_act) == 2 and len(partes_hist) == 2:
-                        sim_nombre = calcular_similitud_texto(partes_act, partes_hist)
