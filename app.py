@@ -42,9 +42,11 @@ if "uploader_key" not in st.session_state:
 if "tareas_activas" not in st.session_state:
     st.session_state["tareas_activas"] = []
 
-# Diccionario global para comunicar el progreso entre el hilo secundario y la interfaz de Streamlit
-if "progreso_subida" not in st.session_state:
-    st.session_state["progreso_subida"] = {"total": 0, "procesadas": 0}
+# Variables globales planas que NO pertenecen a session_state para evitar bloqueos de hilos
+if "total_lote" not in st.session_state:
+    st.session_state["total_lote"] = 0
+if "procesadas_lote" not in st.session_state:
+    st.session_state["procesadas_lote"] = 0
 
 # --- MENÚ EN LA BARRA LATERAL ---
 st.sidebar.header("⚙️ Configuración")
@@ -127,8 +129,15 @@ def procesar_y_vincular_filas(resultados_ocr):
 def calcular_similitud_texto(str1, str2):
     return SequenceMatcher(None, str1, str2).ratio()
 
-# --- FUNCIÓN EN SEGUNDO PLANO SEGURA PARA HILOS ---
-def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket, ref_progreso):
+# --- CONTENEDOR SEGURO DE ESTADO PARA EVITAR CONFLICTOS CON STREAMLIT ---
+class RastreadorProgreso:
+    def __init__(self):
+        self.procesadas = 0
+
+progreso_hilo = RastreadorProgreso()
+
+# --- FUNCIÓN EN SEGUNDO PLANO (CORREGIDA SIN INTERFERENCIAS) ---
+def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket, tracker):
     client_local = create_client(url_sb, key_sb)
     reader_local = easyocr.Reader(['es', 'en'], gpu=False)
     
@@ -158,13 +167,13 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
                 "palabras_clave": datos_huella
             }
             client_local.table("historial_carreras").insert(datos_db).execute()
-        except:
+        except Exception as e:
             pass
         finally:
             if os.path.exists(ruta_temp):
                 os.remove(ruta_temp)
-            # Actualiza el diccionario compartido de manera segura
-            ref_progreso["procesadas"] = idx + 1
+            # Actualizar el objeto tracker externo seguro
+            tracker.procesadas = idx + 1
                 
     gc.collect()
 
@@ -173,40 +182,48 @@ if opcion == "📥 Cargar Historial":
     st.header(f"📥 Guardar Resultados Finales")
     
     if st.session_state["tareas_activas"]:
+        # Filtrar hilos vivos
         st.session_state["tareas_activas"] = [t for t in st.session_state["tareas_activas"] if t.is_alive()]
         
         if st.session_state["tareas_activas"]:
-            total = st.session_state["progreso_subida"]["total"]
-            procesadas = st.session_state["progreso_subida"]["procesadas"]
+            total = st.session_state["total_lote"]
+            procesadas = progreso_hilo.procesadas
+            
+            # Sincronizar el progreso del hilo con el estado visual
+            st.session_state["procesadas_lote"] =流量 = procesadas
             porcentaje = int((procesadas / total) * 100) if total > 0 else 0
             
             with st.container(border=True):
-                st.warning(f"⚙️ **Hay subidas procesándose de fondo:** {procesadas} de {total} completadas.")
+                st.warning(f"⚙️ **Procesando imágenes de fondo:** {procesadas} de {total} completadas.")
                 st.progress(porcentaje / 100.0)
-                st.caption(f"📈 **Progreso actual:** {porcentaje}% indexado con éxito.")
+                st.caption(f"📈 **Progreso actual:** {porcentaje}% indexado en Supabase.")
                 if st.button("🔄 Actualizar estado de subida"):
                     st.rerun()
         else:
-            st.success("✅ **¡Todas las subidas anteriores han finalizado con éxito!**")
+            st.success("✅ **¡Todas las subidas han finalizado! Los datos ya están guardados en tu historial.**")
+            time.sleep(1.0)
+            st.rerun()
             
     archivos_historial = st.file_uploader("Selecciona fotos de resultados finales:", accept_multiple_files=True, type=["jpg", "png", "jpeg"], key=st.session_state["uploader_key"])
     
     if archivos_historial and st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
         archivos_clonados = [{"name": a.name, "data": a.read()} for a in archivos_historial]
         
-        st.session_state["progreso_subida"]["total"] = len(archivos_clonados)
-        st.session_state["progreso_subida"]["procesadas"] = 0
+        st.session_state["total_lote"] = len(archivos_clonados)
+        progreso_hilo.procesadas = 0
+        st.session_state["procesadas_lote"] = 0
         
+        # Pasamos el rastreador de clase pura en lugar del diccionario mutante de Streamlit
         hilo = threading.Thread(
             target=tarea_subida_segundo_plano, 
-            args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket, st.session_state["progreso_subida"])
+            args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket, progreso_hilo)
         )
         hilo.start()
         
         st.session_state["tareas_activas"].append(hilo)
         st.session_state["uploader_key"] = str(uuid.uuid4())
         st.success("✅ ¡Imágenes enviadas al segundo plano con éxito!")
-        time.sleep(1.5)
+        time.sleep(1.2)
         st.rerun()
 
 # --- SECCIÓN: VER HISTORIAL ---
@@ -232,10 +249,3 @@ elif opcion == "🔍 Buscar Carrera":
     
     huellas_actuales = []
 
-    if metodo_busqueda == "📸 Foto en Vivo (Parrilla completa)":
-        foto_busqueda = st.file_uploader("Sube la foto de la pantalla actual/en vivo:", type=["jpg", "png", "jpeg"])
-        if foto_busqueda:
-            with st.spinner("Filtrando y decodificando la tabla de cuotas..."):
-                ruta_busqueda_temp = f"temp_busqueda_{uuid.uuid4().hex[:4]}.jpg"
-                optimizar_imagen_rapido(foto_busqueda.read(), ruta_busqueda_temp)
-                
