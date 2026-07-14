@@ -4,7 +4,9 @@ from PIL import Image
 import os
 import uuid
 import gc
-import threading  # LIBRERÍA CLAVE: Para ejecutar la subida en segundo plano
+import threading  
+import time  
+import io
 from difflib import SequenceMatcher
 from supabase import create_client, Client
 
@@ -30,6 +32,8 @@ except Exception as e:
 @st.cache_resource
 def cargar_ocr():
     return easyocr.Reader(['es', 'en'], gpu=False)
+
+reader_compartido = cargar_ocr()
 
 # Inicializar llaves de control en segundo plano
 if "uploader_key" not in st.session_state:
@@ -60,16 +64,16 @@ def guardar_en_base_datos(categoria, nombre_archivo, url_imagen, palabras_clave)
 
 def cargar_historial_desde_base_datos(categoria):
     try:
-        respuesta = supabase.table("historial_carreras").select("*").eq("categoria", categoria).execute()
+        respuesta = supabase.table("historial_carreras").select("*").eq("categoria", categoria).order("id", descending=True).execute()
         return respuesta.data
     except Exception as e:
         return []
 
 historial_actual = cargar_historial_desde_base_datos(categoria_actual)
 
-def optimizar_imagen_rapido(imagen_bytes, ruta_destino):
-    """Procesa la imagen directamente desde la memoria RAM."""
-    img = Image.open(imagen_bytes)
+def optimizar_imagen_rapido(raw_bytes, ruta_destino):
+    """Procesa la imagen directamente desde los bytes guardados de forma segura en memoria."""
+    img = Image.open(io.BytesIO(raw_bytes))
     if img.width > 600: 
         proporcion = 600 / float(img.width)
         alto = int((float(img.height) * float(proporcion)))
@@ -99,7 +103,7 @@ def calcular_similitud_texto(str1, str2):
 
 # --- FUNCIÓN TRABAJADORA EN SEGUNDO PLANO (BACKGROUND THREAD) ---
 def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket):
-    """Ejecuta de forma invisible el OCR, compresión y subida a Supabase sin tocar la pantalla."""
+    """Ejecuta el OCR de forma aislada, compresión y subida a Supabase sin interferir en la UI."""
     client_local = create_client(url_sb, key_sb)
     reader_local = easyocr.Reader(['es', 'en'], gpu=False)
     
@@ -109,10 +113,10 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
         ruta_temp = f"temp_{nombre_limpio}"
         
         try:
-            # Optimizar desde el volcado de bytes guardado
-            optimizar_imagen_rapido(archivo["bytes"], ruta_temp)
+            # Procesar los bytes clonados inmunes al ciclo de vida de Streamlit
+            optimizar_imagen_rapido(archivo["data"], ruta_temp)
             
-            # Ejecutar el OCR pesado de forma oculta
+            # Ejecución OCR
             textos = reader_local.readtext(ruta_temp, detail=0)
             datos_limpios = limpiar_y_extraer_datos_pantalla(textos)
             
@@ -127,7 +131,6 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
             
             url_publica = f"{url_sb}/storage/v1/object/public/{bucket}/{ruta_almacenamiento}"
             
-            # Insertar en base de datos
             datos_db = {
                 "categoria": categoria,
                 "nombre_archivo": nombre_limpio,
@@ -148,9 +151,7 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
 if opcion == "📥 Cargar Historial":
     st.header(f"📥 Guardar Resultados Finales de {tipo_animal}")
     
-    # Notificación persistente si hay tareas corriendo de fondo
     if st.session_state["tareas_activas"]:
-        # Filtrar hilos que ya terminaron su labor
         st.session_state["tareas_activas"] = [t for t in st.session_state["tareas_activas"] if t.is_alive()]
         if st.session_state["tareas_activas"]:
             st.warning("⚙️ **Hay subidas procesándose de fondo.** Puedes seguir usando la app con normalidad.")
@@ -167,28 +168,24 @@ if opcion == "📥 Cargar Historial":
 
     if st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
         if archivos_historial:
-            # Clonar los archivos en memoria para que no desaparezcan al limpiar el cargador
             archivos_clonados = []
             for a in archivos_historial:
+                # Extraemos los bytes crudos inmediatamente para evitar pérdidas de datos al refrescar
                 archivos_clonados.append({
                     "name": a.name,
-                    "bytes": a  # Streamlit maneja los archivos subidos como BytesIO nativos
+                    "data": a.read()  
                 })
             
-            # Crear y arrancar el hilo secundario invisible
             hilo = threading.Thread(
                 target=tarea_subida_segundo_plano,
                 args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket)
             )
             hilo.start()
             
-            # Guardar registro del hilo para monitorear su estado
             st.session_state["tareas_activas"].append(hilo)
-            
-            # AUTO-LIMPIEZA INMEDIATA: Desaparecen los archivos del cuadro gris instantáneamente
             st.session_state["uploader_key"] = str(uuid.uuid4())
             
-            st.success("✅ **¡Imágenes enviadas al segundo plano con éxito!** El cuadro se ha vaciado y ya puedes cambiar de menú o realizar búsquedas mientras el servidor procesa tus fotos.")
+            st.success("✅ **¡Imágenes enviadas al segundo plano con éxito!**")
             time.sleep(1.5)
             st.rerun()
         else:
@@ -196,45 +193,56 @@ if opcion == "📥 Cargar Historial":
 
 # --- SECCIÓN: VER HISTORIAL ---
 elif opcion == "📋 Ver Historial Completo":
-    st.header(f"📋 Historial de Resultados Finales")
+    st.header(f"📋 Historial de Resultados Finales ({tipo_animal})")
     if st.session_state["tareas_activas"]:
         st.caption("🔄 *Nota: Algunas imágenes podrían estar indexándose en este momento de fondo.*")
         
     if not historial_actual:
-        st.info(f"Aún no hay carreras registradas.")
+        st.info(f"Aún no hay carreras registradas en esta categoría.")
     else:
-        st.write(f"Total: **{len(historial_actual)}** registros.")
-        for elemento in historial_actual:
-            with st.expander(f"🖼️ *{elemento['nombre_archivo']}*"):
-                st.image(elemento['url_imagen'], use_container_width=True)
+        for item in historial_actual:
+            with st.container(border=True):
+                st.image(item["url_imagen"], use_container_width=True)
+                tags = ", ".join(item["palabras_clave"]) if item["palabras_clave"] else "Sin etiquetas"
+                st.caption(f"🔑 **Datos detectados:** {tags}")
 
-# --- SECCIÓN: BUSCADOR POR COMBINACIÓN DE 6 CORREDORES ---
+# --- SECCIÓN: BUSCAR CARRERA ---
 elif opcion == "🔍 Buscar Carrera":
-    st.header(f"🔍 Verificar Combinación de 6 Corredores")
+    st.header(f"🔍 Buscador Inteligente ({tipo_animal})")
     
-    origen_foto = st.radio("Origen de la imagen:", ["Galería del Celular", "Cámara del Celular"])
-    archivo_busqueda = st.file_uploader("Sube la foto de la tabla de inicio", type=["jpg", "png", "jpeg"]) if origen_foto == "Galería del Celular" else st.camera_input("Toma la foto")
+    termino_busqueda = st.text_input("Introduce el nombre del ejemplar, número o pista:", "").strip().lower()
     
-    if archivo_busqueda:
-        with st.spinner(f"Analizando los 6 corredores y sus cuotas..."):
-            reader = cargar_ocr()
-            ruta_buscar = "temp_buscar.jpg"
-            optimizar_imagen_rapido(archivo_busqueda, ruta_buscar)
-            textos_busqueda = reader.readtext(ruta_buscar, detail=0)
-            palabras_busqueda = limpiar_y_extraer_datos_pantalla(textos_busqueda)
-            if os.path.exists(ruta_buscar):
-                os.remove(ruta_buscar)
-                
-        if not historial_actual:
-            st.error("El historial está vacío. Por favor, carga los resultados finales primero.")
-        elif not palabras_busqueda:
-            st.warning("⚠️ No se detectaron datos legibles.")
-        else:
-            carrera_repetida = None
-            max_corredores_coincidentes = 0
+    if termino_busqueda:
+        resultados_encontrados = []
+        
+        for item in historial_actual:
+            coincidencia_alta = False
+            max_similitud = 0.0
             
-            for carrera in historial_actual:
-                palabras_carrera = carrera["palabras_clave"]
-                coincidencias_estrictas = 0
+            for palabra in item["palabras_clave"]:
+                if termino_busqueda in palabra:
+                    coincidencia_alta = True
+                    break
                 
-                for p_carrera in palabras_carrera:
+                similitud = calcular_similitud_texto(termino_busqueda, palabra)
+                if similitud > max_similitud:
+                    max_similitud = similitud
+            
+            if coincidencia_alta or max_similitud >= 0.75:
+                # Almacenamos la tupla con el valor numérico para poder ordenar de forma segura
+                resultados_encontrados.append((item, max_similitud if not coincidencia_alta else 1.0))
+        
+        # Ordenamos usando explícitamente el índice numérico [1] (el puntaje de similitud)
+        resultados_encontrados.sort(key=lambda x: x[1], reverse=True)
+        
+        if resultados_encontrados:
+            st.success(f"✨ Se encontraron {len(resultados_encontrados)} resultados posibles:")
+            for res, score in resultados_encontrados:
+                with st.container(border=True):
+                    st.image(res["url_imagen"], use_container_width=True)
+                    tags = ", ".join(res["palabras_clave"])
+                    st.caption(f"🔑 **Datos detectados:** {tags}")
+                    if score < 1.0 and score > 0.0:
+                        st.caption(f"🎯 *Precisión de coincidencia: {int(score * 100)}%*")
+        else:
+            st.warning("❌ No se encontraron registros que coincidan con tu búsqueda.")
