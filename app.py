@@ -36,10 +36,15 @@ def cargar_ocr():
 
 reader_compartido = cargar_ocr()
 
+# Inicializar llaves de control en segundo plano y progreso
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = str(uuid.uuid4())
 if "tareas_activas" not in st.session_state:
     st.session_state["tareas_activas"] = []
+if "total_imagenes_lote" not in st.session_state:
+    st.session_state["total_imagenes_lote"] = 0
+if "imagenes_procesadas" not in st.session_state:
+    st.session_state["imagenes_procesadas"] = 0
 
 # --- MENÚ EN LA BARRA LATERAL ---
 st.sidebar.header("⚙️ Configuración")
@@ -69,10 +74,6 @@ def optimizar_imagen_rapido(raw_bytes, ruta_destino):
     img.save(ruta_destino, "JPEG", quality=60, optimize=True)
 
 def procesar_y_vincular_filas(resultados_ocr):
-    """
-    Agrupa los textos por altura en el eje Y para asociar nombres y cuotas,
-    omitiendo el carril físico para evitar variaciones espaciales.
-    """
     filas_agrupadas = {}
     tolerancia_y = 12  
     
@@ -84,7 +85,7 @@ def procesar_y_vincular_filas(resultados_ocr):
         if any(c.isdigit() for c in texto_limpio) and ('.' in texto_limpio or ',' in texto_limpio):
             texto_limpio = texto_limpio.replace('o', '0').replace('i', '1').replace('s', '5').replace(',', '.')
 
-        centro_y = (bbox[0][1] + bbox[2][1]) / 2
+        centro_y = (bbox + bbox) / 2
         
         fila_encontrada = False
         for y_existente in filas_agrupadas.keys():
@@ -99,8 +100,8 @@ def procesar_y_vincular_filas(resultados_ocr):
     huellas_corredores = []
     
     for y in sorted(filas_agrupadas.keys()):
-        elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x[0][0])
-        textos_fila = [item[1] for item in elementos_fila]
+        elementos_fila = sorted(filas_agrupadas[y], key=lambda x: x)
+        textos_fila = [item for item in elementos_fila]
         
         cuota = None
         palabras_nombre = []
@@ -108,11 +109,9 @@ def procesar_y_vincular_filas(resultados_ocr):
         for t in textos_fila:
             if t in ["1", "2", "3", "4", "5", "6"]:
                 continue
-            
             if bool(re.match(r'^\d+\.\d+$', t)) and cuota is None:
                 cuota = t
                 continue
-                
             if len(t) > 2 and not any(c.isdigit() for c in t):
                 if t in ["ganador", "segundo", "tercero", "juego", "resultados", "finalizado", "carrera", "caballos", "galgos", "ultimos", "valoracion", "gana", "segu", "terce", "estado", "pista"]:
                     continue
@@ -128,12 +127,12 @@ def procesar_y_vincular_filas(resultados_ocr):
 def calcular_similitud_texto(str1, str2):
     return SequenceMatcher(None, str1, str2).ratio()
 
-# --- FUNCIÓN EN SEGUNDO PLANO ---
-def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket):
+# --- FUNCIÓN EN SEGUNDO PLANO MODIFICADA PARA MONITOREAR PROGRESO ---
+def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket, estado_global):
     client_local = create_client(url_sb, key_sb)
     reader_local = easyocr.Reader(['es', 'en'], gpu=False)
     
-    for archivo in lista_archivos:
+    for idx, archivo in enumerate(lista_archivos):
         id_unico = uuid.uuid4().hex[:8]
         nombre_limpio = f"{id_unico}_{archivo['name'].replace(' ', '_')}"
         ruta_temp = f"temp_{nombre_limpio}"
@@ -164,22 +163,53 @@ def tarea_subida_segundo_plano(lista_archivos, categoria, url_sb, key_sb, bucket
         finally:
             if os.path.exists(ruta_temp):
                 os.remove(ruta_temp)
+            # 🚀 Actualizar el contador cada vez que termina de procesarse una imagen con éxito o fallo
+            estado_global["imagenes_procesadas"] = idx + 1
+                
     gc.collect()
 
-# --- SECCIÓN: CARGA MASIVA ---
+# --- SECCIÓN: CARGA MASIVA CON MONITOREO DE PROGRESO ---
 if opcion == "📥 Cargar Historial":
     st.header(f"📥 Guardar Resultados Finales")
+    
+    # Comprobación de tareas activas de fondo
     if st.session_state["tareas_activas"]:
         st.session_state["tareas_activas"] = [t for t in st.session_state["tareas_activas"] if t.is_alive()]
+        
         if st.session_state["tareas_activas"]:
-            st.warning("⚙️ **Hay subidas procesándose de fondo.**")
+            total = st.session_state["total_imagenes_lote"]
+            procesadas = st.session_state["imagenes_procesadas"]
+            
+            # Calcular porcentaje de forma segura sin dividir por cero
+            porcentaje = int((procesadas / total) * 100) if total > 0 else 0
+            
+            # Mostrar contenedor visual con barra de progreso y porcentaje numérico
+            with st.container(border=True):
+                st.warning(f"⚙️ **Procesando imágenes de fondo:** {procesadas} de {total} completadas.")
+                st.progress(porcentaje / 100.0)
+                st.caption(f"📈 **Progreso actual:** {porcentaje}% indexado con éxito.")
+                
+                # Botón de refresco manual rápido para móviles
+                if st.button("🔄 Actualizar estado de subida"):
+                    st.rerun()
+        else:
+            st.success("✅ **¡Todas las subidas anteriores han finalizado con éxito!**")
             
     archivos_historial = st.file_uploader("Selecciona fotos de resultados finales:", accept_multiple_files=True, type=["jpg", "png", "jpeg"], key=st.session_state["uploader_key"])
     
     if archivos_historial and st.button("Enviar y Procesar en Segundo Plano", use_container_width=True):
         archivos_clonados = [{"name": a.name, "data": a.read()} for a in archivos_historial]
-        hilo = threading.Thread(target=tarea_subida_segundo_plano, args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket))
+        
+        # Inicializar los contadores en la sesión antes de lanzar el hilo
+        st.session_state["total_imagenes_lote"] = len(archivos_clonados)
+        st.session_state["imagenes_procesadas"] = 0
+        
+        hilo = threading.Thread(
+            target=tarea_subida_segundo_plano, 
+            args=(archivos_clonados, categoria_actual, SUPABASE_URL, SUPABASE_KEY, nombre_bucket, st.session_state)
+        )
         hilo.start()
+        
         st.session_state["tareas_activas"].append(hilo)
         st.session_state["uploader_key"] = str(uuid.uuid4())
         st.success("✅ ¡Imágenes enviadas al segundo plano con éxito!")
@@ -210,36 +240,3 @@ elif opcion == "🔍 Buscar Carrera":
     huellas_actuales = []
 
     if metodo_busqueda == "📸 Foto en Vivo (Parrilla completa)":
-        foto_busqueda = st.file_uploader("Sube la foto de la pantalla actual/en vivo:", type=["jpg", "png", "jpeg"])
-        if foto_busqueda:
-            with st.spinner("Filtrando y decodificando la tabla de cuotas..."):
-                ruta_busqueda_temp = f"temp_busqueda_{uuid.uuid4().hex[:4]}.jpg"
-                optimizar_imagen_rapido(foto_busqueda.read(), ruta_busqueda_temp)
-                
-                resultados_raw = reader_compartido.readtext(ruta_busqueda_temp, detail=1)
-                huellas_actuales = procesar_y_vincular_filas(resultados_raw)
-                
-                if os.path.exists(ruta_busqueda_temp):
-                    os.remove(ruta_busqueda_temp)
-                
-                if huellas_actuales:
-                    st.info("📋 **Corredores y cuotas legítimos detectados en vivo:**")
-                    for h in huellas_actuales:
-                        st.write(f"🔹 {h.replace('_', ' ➡️ Cuota: ').title()}")
-                else:
-                    st.warning("⚠️ No se pudieron aislar filas de competidores válidas. Asegúrate de enfocar bien la lista central.")
-
-        if huellas_actuales:
-            lista_similitudes = []
-            coincidencias_exactas_100 = []
-            
-            for item in historial_actual:
-                clones_perfectos = 0
-                solo_nombre = 0
-                
-                for h_actual in huellas_actuales:
-                    partes_act = h_actual.split("_")
-                    
-                    for h_historial in item["palabras_clave"]:
-                        partes_hist = h_historial.split("_")
-                        
